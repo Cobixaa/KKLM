@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Xlinker --dependency-file=CMakeFiles/kllm_demo.dir/link.d CMakeFiles/kllm_demo.dir/examples/main.cpp.o -o kllm_demo
