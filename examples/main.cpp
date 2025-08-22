@@ -96,11 +96,51 @@ static void test_ir() {
 	auto n0 = kllm::GraphBuilder::input(x);
 	auto n1 = kllm::GraphBuilder::transform(n0);
 	auto n2 = kllm::GraphBuilder::relu(n1);
-	auto planned = kllm::Planner::plan(n2);
-	kllm::Tensor out = planned->evaluate();
+	kllm::Profiler p;
+	kllm::Scheduler sched(p);
+	auto plan = sched.plan(n2);
+	kllm::Tensor out = plan.root->evaluate();
 	float sum = 0.0f;
 	for (float v : out.values) sum += v;
-	std::cout << "IR planned Transform+Relu sum: " << sum << "\n";
+	std::cout << "IR+Scheduler sum: " << sum << ", fused=" << (plan.used_fusion ? 1 : 0) << "\n";
+}
+
+static void test_transforms_extras() {
+	// Low-rank sanity
+	const std::size_t in_dim = 4, out_dim = 3, rank = 2;
+	std::vector<float> U = {
+		1, 0,
+		0, 1,
+		1, 1
+	};
+	std::vector<float> V = {
+		1, 0,
+		0, 1,
+		1, 0,
+		0, 1
+	};
+	std::vector<float> x = {1,2,3,4};
+	std::vector<float> y(out_dim);
+	kllm::low_rank_apply(U.data(), V.data(), out_dim, in_dim, rank, x.data(), y.data());
+	float sum = 0.0f; for (float v : y) sum += v;
+	std::cout << "Low-rank sum: " << sum << "\n";
+}
+
+static void test_config_and_onnx() {
+	kllm::set_deterministic(true);
+	auto st = kllm::import_onnx_model("dummy.onnx");
+	if (!st.ok()) std::cout << "ONNX import error: " << st.message << "\n";
+}
+
+static void test_training() {
+	std::vector<float> params = {1.0f};
+	std::vector<float> inputs = {1,2,3,4};
+	std::vector<float> targets = {1.1f, 1.9f, 3.1f, 3.9f};
+	kllm::TrainingStepResult res{};
+	kllm::OptimizerConfig opt; opt.lr = 0.1f;
+	auto st = kllm::train_step_mse(params, inputs, targets, opt, res);
+	if (!st.ok()) std::cout << "Train error: " << st.message << "\n";
+	std::cout << "Training step loss: " << res.loss << ", param0: " << params[0] << "\n";
 }
 
 int main() {
@@ -112,5 +152,8 @@ int main() {
 	test_quant();
 	test_rewards();
 	test_ir();
+	test_transforms_extras();
+	test_config_and_onnx();
+	test_training();
 	return 0;
 }
