@@ -52,6 +52,30 @@ static void test_fused() {
 	std::cout << "Fused FWHT-scale-add checksum: " << checksum << "\n";
 }
 
+static void test_fused_bias_relu() {
+	std::vector<float> x(8);
+	std::vector<float> b(8, 0.5f);
+	for (std::size_t i = 0; i < x.size(); ++i) x[i] = (i % 2 == 0) ? -1.5f : 1.0f;
+	std::vector<float> y(8, 0.0f);
+	kllm::fused_fwht_bias_relu(x.data(), b.data(), x.size(), y.data());
+	float sum = 0.0f;
+	for (float v : y) sum += v;
+	std::cout << "Fused FWHT+bias+ReLU sum: " << sum << "\n";
+}
+
+static void test_quant() {
+	std::vector<float> x(16);
+	for (std::size_t i = 0; i < x.size(); ++i) x[i] = (i - 8) * 0.25f;
+	auto qp = kllm::choose_symmetric_int8_scale(x.data(), x.size());
+	std::vector<int8_t> q(x.size());
+	kllm::quantize_int8(x.data(), x.size(), q.data(), qp);
+	std::vector<float> deq(x.size());
+	kllm::dequantize_int8(q.data(), q.size(), qp.scale, deq.data());
+	float max_abs_err = 0.0f;
+	for (std::size_t i = 0; i < x.size(); ++i) max_abs_err = std::max(max_abs_err, std::fabs(x[i] - deq[i]));
+	std::cout << "Quant max abs error: " << max_abs_err << " (scale=" << qp.scale << ")\n";
+}
+
 static void test_ir() {
 	std::vector<float> x(8);
 	for (std::size_t i = 0; i < x.size(); ++i) x[i] = (i % 2 == 0) ? -1.0f : 2.0f;
@@ -70,6 +94,8 @@ int main() {
 	test_ntt();
 	test_countsketch();
 	test_fused();
+	test_fused_bias_relu();
+	test_quant();
 	test_ir();
 	return 0;
 }
