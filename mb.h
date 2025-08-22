@@ -202,4 +202,38 @@ static inline size_t mb_calibrate_iters(void (*fn)(void *), void *arg, size_t ma
 	return iters;
 }
 
+// ---- Extra asserts ----
+static inline void mb_expect_ne_ptr(const void *a, const void *b, const char *aexpr, const char *bexpr, const char *file, int line) {
+	g_mb_test.total_asserts++;
+	if (MB_UNLIKELY(a == b)) {
+		g_mb_test.failed_asserts++;
+		fprintf(stderr, "[ASSERT FAIL] %s:%d: %s != %s (both %p)\n", file, line, aexpr, bexpr, a);
+	}
+}
+#define MB_EXPECT_NE_PTR(a,b) mb_expect_ne_ptr((a),(b),#a,#b,__FILE__,__LINE__)
+
+static inline void mb_expect_eq_mem(const void *a, const void *b, size_t len, const char *aexpr, const char *bexpr, const char *file, int line) {
+	g_mb_test.total_asserts++;
+	if (MB_UNLIKELY(len > 0u && (a == NULL || b == NULL))) {
+		g_mb_test.failed_asserts++;
+		fprintf(stderr, "[ASSERT FAIL] %s:%d: %s == %s (null with len=%zu)\n", file, line, aexpr, bexpr, len);
+		return;
+	}
+	if (MB_UNLIKELY(memcmp(a, b, len) != 0)) {
+		g_mb_test.failed_asserts++;
+		fprintf(stderr, "[ASSERT FAIL] %s:%d: memory not equal for %s and %s (len=%zu)\n", file, line, aexpr, bexpr, len);
+	}
+}
+#define MB_EXPECT_EQ_MEM(a,b,len) mb_expect_eq_mem((a),(b),(len),#a,#b,__FILE__,__LINE__)
+
+// ---- Env helpers ----
+static inline uint64_t mb_getenv_u64(const char *name, uint64_t default_value) {
+	const char *s = getenv(name);
+	if (s == NULL || *s == '\0') return default_value;
+	char *endptr = NULL;
+	unsigned long long v = strtoull(s, &endptr, 10);
+	if (endptr == s) return default_value;
+	return (uint64_t)v;
+}
+
 #endif // MB_H_
