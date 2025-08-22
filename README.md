@@ -32,7 +32,7 @@ KLLM (Key-Light Large Model) is a CPU-first, C++17 header-only library providing
 
 ---
 
-### Build — Direct (no Make/CMake)
+### Build — Direct (single-step)
 
 Dependencies: clang++ (or g++), Linux or Android/Termux.
 
