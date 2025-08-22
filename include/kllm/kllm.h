@@ -8,3 +8,6 @@
 #include "kllm/ir.h"
 #include "kllm/quant.h"
 #include "kllm/parallel.h"
+#include "kllm/status.h"
+#include "kllm/api.h"
+#include "kllm/reward.h"

@@ -7,8 +7,10 @@
 
 static void test_fwht() {
 	std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
-	kllm::fwht_inplace(x.data(), x.size());
-	kllm::fwht_inplace_inverse(x.data(), x.size());
+	auto st = kllm::fwht(x);
+	if (!st.ok()) std::cout << "FWHT error: " << st.message << "\n";
+	st = kllm::fwht_inverse(x);
+	if (!st.ok()) std::cout << "FWHT inv error: " << st.message << "\n";
 	float max_abs_err = 0.0f;
 	const float expected[] = {1.0f,2.0f,3.0f,4.0f,5.0f,6.0f,7.0f,8.0f};
 	for (std::size_t i = 0; i < x.size(); ++i) {
@@ -52,28 +54,40 @@ static void test_fused() {
 	std::cout << "Fused FWHT-scale-add checksum: " << checksum << "\n";
 }
 
-static void test_fused_bias_relu() {
+static void test_simple_bias_relu() {
 	std::vector<float> x(8);
 	std::vector<float> b(8, 0.5f);
 	for (std::size_t i = 0; i < x.size(); ++i) x[i] = (i % 2 == 0) ? -1.5f : 1.0f;
-	std::vector<float> y(8, 0.0f);
-	kllm::fused_fwht_bias_relu(x.data(), b.data(), x.size(), y.data());
+	std::vector<float> y;
+	auto st = kllm::fused_transform_bias_relu(x, b, y);
+	if (!st.ok()) std::cout << "Fused API error: " << st.message << "\n";
 	float sum = 0.0f;
 	for (float v : y) sum += v;
-	std::cout << "Fused FWHT+bias+ReLU sum: " << sum << "\n";
+	std::cout << "Fused API FWHT+bias+ReLU sum: " << sum << "\n";
 }
 
 static void test_quant() {
 	std::vector<float> x(16);
 	for (std::size_t i = 0; i < x.size(); ++i) x[i] = (i - 8) * 0.25f;
-	auto qp = kllm::choose_symmetric_int8_scale(x.data(), x.size());
-	std::vector<int8_t> q(x.size());
-	kllm::quantize_int8(x.data(), x.size(), q.data(), qp);
-	std::vector<float> deq(x.size());
-	kllm::dequantize_int8(q.data(), q.size(), qp.scale, deq.data());
+	kllm::QuantParams qp{};
+	std::vector<int8_t> q;
+	std::vector<float> deq;
+	auto st = kllm::quantize_dequantize(x, q, deq, qp);
+	if (!st.ok()) std::cout << "Quant API error: " << st.message << "\n";
 	float max_abs_err = 0.0f;
 	for (std::size_t i = 0; i < x.size(); ++i) max_abs_err = std::max(max_abs_err, std::fabs(x[i] - deq[i]));
 	std::cout << "Quant max abs error: " << max_abs_err << " (scale=" << qp.scale << ")\n";
+}
+
+static void test_rewards() {
+	std::vector<float> pred = {0.1f, 0.9f, -0.2f, 1.0f};
+	std::vector<float> target = {0.0f, 1.0f, 0.0f, 1.0f};
+	float mse = kllm::reward_mse(pred, target);
+	float cos = kllm::reward_cosine_similarity(pred, target);
+	std::vector<float> logits = {0.2f, 0.8f, 0.6f, 0.4f};
+	std::vector<int> labels = {1, 0};
+	float acc = kllm::reward_top1_accuracy(logits, labels, 2);
+	std::cout << "Reward MSE=" << mse << ", cosine=" << cos << ", acc=" << acc << "\n";
 }
 
 static void test_ir() {
@@ -94,8 +108,9 @@ int main() {
 	test_ntt();
 	test_countsketch();
 	test_fused();
-	test_fused_bias_relu();
+	test_simple_bias_relu();
 	test_quant();
+	test_rewards();
 	test_ir();
 	return 0;
 }

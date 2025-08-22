@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
 
 #if defined(__AVX2__)
 	#include <immintrin.h>
@@ -24,11 +25,9 @@ inline QuantParams choose_symmetric_int8_scale(const float *data, std::size_t le
 		if (v > max_abs) max_abs = v;
 	}
 	QuantParams p{};
-	if (max_abs <= 1e-8f) {
-		p.scale = 1.0f;
-	} else {
-		p.scale = max_abs / 127.0f;
-	}
+	float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 127.0f);
+	if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
+	p.scale = s;
 	return p;
 }
 
@@ -66,8 +65,9 @@ inline void quantize_int8(const float *input, std::size_t length, int8_t *output
 
 inline void dequantize_int8(const int8_t *input, std::size_t length, float scale, float *output) {
 	if (input == nullptr || output == nullptr) return;
+	float s = (!std::isfinite(scale) || scale <= 0.0f) ? 1.0f : scale;
 	for (std::size_t i = 0; i < length; ++i) {
-		output[i] = static_cast<float>(input[i]) * scale;
+		output[i] = static_cast<float>(input[i]) * s;
 	}
 }
 
