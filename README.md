@@ -11,7 +11,7 @@ KLLM (Key-Light Large Model) is a CPU-first, C++17 header-only library providing
 - Aligned allocation and basic thread affinity API
 - Tiny IR + planner that fuses Transform+Relu
 - New: int8 quantization helpers (scale selection, encode/decode)
-- New: lightweight thread pool (for future parallel transforms)
+- New: lightweight thread pool and parallel FWHT
 
 ---
 
@@ -36,22 +36,20 @@ KLLM (Key-Light Large Model) is a CPU-first, C++17 header-only library providing
 
 Dependencies: clang++ (or g++), Linux or Android/Termux.
 
-Recommended flags (fast, warnings, native CPU):
-
 ```bash
-# x86-64 AVX2 build
+# x86-64 (auto-detect AVX/AVX2/AVX512 on host)
 clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC \
-  -Wall -Wextra -Wpedantic \
+  -Wall -Wextra -Wpedantic -Werror \
   -Iinclude examples/main.cpp -o kllm_demo
 
-# ARM64 NEON build (Termux/Android)
+# aarch64 (ARM64 NEON)
 clang++ -std=c++17 -O3 -march=armv8-a+simd -mtune=native -fPIC \
-  -Wall -Wextra -Wpedantic \
+  -Wall -Wextra -Wpedantic -Werror \
   -Iinclude examples/main.cpp -o kllm_demo
 
-# Benchmark build
+# Benchmark
 clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC \
-  -Wall -Wextra -Wpedantic \
+  -Wall -Wextra -Wpedantic -Werror \
   -Iinclude bench/bench.cpp -o kllm_bench
 ```
 
@@ -60,10 +58,6 @@ Run:
 ./kllm_demo
 ./kllm_bench
 ```
-
-Notes:
-- `-march=native` automatically enables AVX2/AVX512/NEON on the host. Use explicit `-mavx2` if needed.
-- The library is header-only; just add `-Iinclude` to your project.
 
 ---
 
@@ -77,6 +71,7 @@ Include umbrella header:
 - FWHT (in-place), length must be power-of-two:
 ```cpp
 void kllm::fwht_inplace(float *data, std::size_t length);
+void kllm::fwht_inplace_parallel(float *data, std::size_t length, kllm::ThreadPool &pool);
 void kllm::fwht_inplace_inverse(float *data, std::size_t length);
 ```
 
@@ -99,7 +94,7 @@ void kllm::fused_fwht_scale_add(const float *input, std::size_t length, float sc
 void kllm::fused_fwht_bias_relu(const float *input, const float *bias, std::size_t length, float *destination);
 ```
 
-- Memory utilities:
+- Memory:
 ```cpp
 std::unique_ptr<void, kllm::FreeDeleter> kllm::allocate_aligned_bytes(std::size_t size_bytes, std::size_t alignment);
 
@@ -125,7 +120,7 @@ struct kllm::Planner {
 };
 ```
 
-- Quantization helpers:
+- Quantization:
 ```cpp
 struct kllm::QuantParams { float scale; };
 kllm::QuantParams kllm::choose_symmetric_int8_scale(const float *data, std::size_t length);
@@ -135,28 +130,31 @@ void kllm::dequantize_int8(const int8_t *input, std::size_t length, float scale,
 
 - Parallel helpers:
 ```cpp
-class kllm::ThreadPool { public: explicit ThreadPool(std::size_t threads); void enqueue(std::function<void()> fn); };
+class kllm::ThreadPool { public: explicit ThreadPool(std::size_t threads); void enqueue(std::function<void()> fn); void wait(); };
+void kllm::parallel_for_blocks(ThreadPool &pool, std::size_t begin, std::size_t end, std::size_t step, std::function<void(std::size_t)> fn);
 ```
 
 ---
 
-### Benchmark Results (on this environment)
+### Benchmark Results (this environment)
 ```
-FWHT 1M floats: 8.21 ms
-Fused FWHT-scale-add 1M: 10.08 ms
-NTT 262k uint32: 8.13 ms
-CountSketch 1M -> 262k (3 hashes): 4.30 ms
+FWHT 1M floats: 8.24 ms
+FWHT(par) 1M floats: 5.70 ms
+Fused FWHT-scale-add 1M: 9.77 ms
+NTT 262k uint32: 8.17 ms
+CountSketch 1M -> 262k (3 hashes): 4.33 ms
 ```
-System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features autodetected.
+System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features autodetected. Results vary by CPU.
 
 ---
 
 ### Performance Notes
 - Prefer power-of-two lengths for transforms.
-- Use `-march=native -O3` and pin threads via `set_current_thread_affinity` for NUMA.
-- Keep working sets within L1/L2; consider tiling at the call-site.
+- Use `-march=native -O3`. Pin threads via `set_current_thread_affinity` for NUMA.
+- Keep working sets within L1/L2; consider tiling at the call site.
 - Fuse downstream pointwise ops with transforms (see IR planner) to reduce memory traffic.
 - For int8 paths, pack/accumulate in int32 and dequantize late; batch operations for better cache locality.
+- On aarch64, build with `-march=armv8-a+simd`; NEON kernels are enabled automatically.
 
 ---
 

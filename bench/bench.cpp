@@ -27,6 +27,18 @@ int main() {
 		std::cout << "FWHT 1M floats: " << time_ms(t0, t1) << " ms" << "\n";
 	}
 
+	// Parallel FWHT bench
+	{
+		const std::size_t n = 1 << 20;
+		std::vector<float> x(n);
+		for (float &v : x) v = dist(rng);
+		kllm::ThreadPool pool(std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+		auto t0 = clock_type::now();
+		kllm::fwht_inplace_parallel(x.data(), x.size(), pool);
+		auto t1 = clock_type::now();
+		std::cout << "FWHT(par) 1M floats: " << time_ms(t0, t1) << " ms" << "\n";
+	}
+
 	// Fused FWHT-scale-add
 	{
 		const std::size_t n = 1 << 20;

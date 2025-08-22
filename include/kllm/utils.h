@@ -40,4 +40,10 @@ inline bool is_power_of_two(std::size_t value) {
 	#define KLLM_ASSUME_ALIGNED(ptr, align) (ptr)
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+	#define KLLM_RESTRICT __restrict__
+#else
+	#define KLLM_RESTRICT
+#endif
+
 } // namespace kllm
