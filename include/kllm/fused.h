@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 
 #include "kllm/fast_transform.h"
+#include "kllm/utils.h"
 
 namespace kllm {
 

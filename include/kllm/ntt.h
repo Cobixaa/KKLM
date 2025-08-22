@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <type_traits>
 
+#include "kllm/utils.h"
+
 namespace kllm {
 
 // 998244353 = 119 * 2^23 + 1, primitive root g = 3
@@ -41,10 +43,6 @@ inline std::uint32_t pow_mod(std::uint32_t base, std::uint32_t exp) {
 inline std::uint32_t inv_mod(std::uint32_t x) {
 	// Fermat inverse: x^(mod-2)
 	return pow_mod(x, kMod - 2u);
-}
-
-inline bool is_power_of_two(std::size_t value) {
-	return value != 0 && (value & (value - 1)) == 0;
 }
 
 inline void bit_reverse_permute(std::vector<std::uint32_t> &a) {

@@ -11,11 +11,9 @@
 	#include <arm_neon.h>
 #endif
 
-namespace kllm {
+#include "kllm/utils.h"
 
-inline bool is_power_of_two(std::size_t value) {
-	return value != 0 && (value & (value - 1)) == 0;
-}
+namespace kllm {
 
 // In-place Fast Walsh-Hadamard Transform for contiguous float data.
 // Self-inverse up to scaling by N. Caller ensures length is a power of two.
