@@ -4,7 +4,7 @@
 #include <random>
 #include <algorithm>
 
-#include "kllm/kllm.h"
+#include "kklm.h"
 
 using clock_type = std::chrono::steady_clock;
 

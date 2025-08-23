@@ -3,7 +3,7 @@
 #include <random>
 #include <cmath>
 
-#include "kllm/kllm.h"
+#include "kklm.h"
 
 static void test_fwht() {
 	std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};

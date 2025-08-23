@@ -10,25 +10,16 @@ KLLM (Key-Light Large Model) is a CPU-first, C++17 header-only library providing
 - Fused transform-scale-add helper; new fused FWHT+bias+ReLU
 - Aligned allocation and basic thread affinity API
 - Tiny IR + planner that fuses Transform+Relu
-- New: int8 quantization helpers (scale selection, encode/decode)
-- New: lightweight thread pool and parallel FWHT
+- int8 quantization helpers (scale selection, encode/decode)
+- Lightweight thread pool and parallel FWHT
 
 ---
 
-### Directory Layout
-- `include/kllm/`: public headers
-  - `kllm.h`: umbrella include
-  - `utils.h`: misc utilities, prefetch, alignment macros
-  - `fast_transform.h`: FWHT and inverse
-  - `ntt.h`: iterative NTT mod 998244353
-  - `sketch.h`: CountSketch
-  - `fused.h`: fused FWHT + scale + add; fused FWHT+bias+ReLU
-  - `memory.h`: aligned allocation and affinity
-  - `ir.h`: minimal nodes, planner, and evaluate
-  - `quant.h`: int8 quantization helpers
-  - `parallel.h`: lightweight thread pool
-- `examples/main.cpp`: demo exercising all APIs
+### Layout
+- `kklm.h`: single public header (drop-in)
+- `examples/main.cpp`: usage demo
 - `bench/bench.cpp`: micro-benchmarks
+- `test.cpp`: basic correctness tests
 
 ---
 
@@ -37,35 +28,41 @@ KLLM (Key-Light Large Model) is a CPU-first, C++17 header-only library providing
 Dependencies: clang++ (or g++), Linux or Android/Termux.
 
 ```bash
-# x86-64 (auto-detect AVX/AVX2/AVX512 on host)
+# x86-64 (auto-detect)
 clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC \
   -Wall -Wextra -Wpedantic -Werror \
-  -Iinclude examples/main.cpp -o kllm_demo
+  -I. examples/main.cpp -o kllm_demo
 
 # aarch64 (ARM64 NEON)
 clang++ -std=c++17 -O3 -march=armv8-a+simd -mtune=native -fPIC \
   -Wall -Wextra -Wpedantic -Werror \
-  -Iinclude examples/main.cpp -o kllm_demo
+  -I. examples/main.cpp -o kllm_demo
 
 # Benchmark
 clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC \
   -Wall -Wextra -Wpedantic -Werror \
-  -Iinclude bench/bench.cpp -o kllm_bench
+  -I. bench/bench.cpp -o kllm_bench
+
+# Tests
+clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC \
+  -Wall -Wextra -Wpedantic -Werror \
+  -I. test.cpp -o kllm_test
 ```
 
 Run:
 ```bash
 ./kllm_demo
 ./kllm_bench
+./kllm_test
 ```
 
 ---
 
 ### Public API Overview
 
-Include umbrella header:
+Include the single header:
 ```cpp
-#include "kllm/kllm.h"
+#include "kklm.h"
 ```
 
 - FWHT (in-place), length must be power-of-two:
@@ -138,11 +135,14 @@ void kllm::parallel_for_blocks(ThreadPool &pool, std::size_t begin, std::size_t 
 
 ### Benchmark Results (this environment)
 ```
-FWHT 1M floats: 8.24 ms
-FWHT(par) 1M floats: 5.70 ms
-Fused FWHT-scale-add 1M: 9.77 ms
-NTT 262k uint32: 8.17 ms
-CountSketch 1M -> 262k (3 hashes): 4.33 ms
+FWHT 1M floats: 8.26287 ms
+FWHT(par,4) 1M floats: 3.06927 ms
+Fused FWHT-scale-add 1M: 10.3948 ms
+NTT 262k uint32: 8.06832 ms
+CountSketch 1M -> 262k (3 hashes): 4.11619 ms
+BlockDiag float 1024x(16x16): 3e-05 ms
+BlockDiag int8 1024x(16x16): 3.9e-05 ms
+LowRank 4096x4096 (r=64): 3.8e-05 ms
 ```
 System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features autodetected. Results vary by CPU.
 
