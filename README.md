@@ -166,4 +166,5 @@ System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features auto
 ---
 
 ### License
-MIT
+You may use, copy, and modify this code for personal, educational, or research purposes only.
+You may NOT sell or distribute this software or derivatives for commercial purposes without explicit permission.
