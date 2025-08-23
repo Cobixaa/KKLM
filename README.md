@@ -133,16 +133,23 @@ void kllm::parallel_for_blocks(ThreadPool &pool, std::size_t begin, std::size_t 
 
 ---
 
+### Test Results (this environment)
+```
+ALL TESTS PASSED
+```
+
 ### Benchmark Results (this environment)
 ```
-FWHT 1M floats: 8.26287 ms
-FWHT(par,4) 1M floats: 3.06927 ms
-Fused FWHT-scale-add 1M: 10.3948 ms
-NTT 262k uint32: 8.06832 ms
-CountSketch 1M -> 262k (3 hashes): 4.11619 ms
-BlockDiag float 1024x(16x16): 3e-05 ms
-BlockDiag int8 1024x(16x16): 3.9e-05 ms
-LowRank 4096x4096 (r=64): 3.8e-05 ms
+FWHT 1M floats: 8.20489 ms (7.82479 ns/elem)
+FWHT(par,4) 1M floats: 3.58342 ms (3.41742 ns/elem)
+Fused FWHT-scale-add 1M: 10.4894 ms (10.0035 ns/elem)
+FWHT 2048 floats: 12916 ns (6.30664 ns/elem)
+Fused FWHT-scale-add 2048: 13177 ns (6.43408 ns/elem)
+NTT 262k uint32: 8.06189 ms (30.7537 ns/elem)
+CountSketch 1M -> 262k (3 hashes): 4.15962 ms (3.96692 ns/elem)
+BlockDiag float 1024x(16x16): 0.052263 ms (3.18988 ns/elem)
+BlockDiag int8 1024x(16x16): 0.046482 ms (2.83704 ns/elem)
+LowRank 4096x4096 (r=64): 3.9e-05 ms (0.00952148 ns/elem)
 ```
 System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features autodetected. Results vary by CPU.
 
