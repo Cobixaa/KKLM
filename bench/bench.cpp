@@ -8,8 +8,12 @@
 
 using clock_type = std::chrono::steady_clock;
 
-static double time_ms(clock_type::time_point a, clock_type::time_point b) {
+static inline double time_ms(clock_type::time_point a, clock_type::time_point b) {
 	return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+static inline double time_ns(clock_type::time_point a, clock_type::time_point b) {
+	return std::chrono::duration<double, std::nano>(b - a).count();
 }
 
 int main() {
@@ -24,7 +28,9 @@ int main() {
 		auto t0 = clock_type::now();
 		kllm::fwht_inplace(x.data(), x.size());
 		auto t1 = clock_type::now();
-		std::cout << "FWHT 1M floats: " << time_ms(t0, t1) << " ms" << "\n";
+		double ms = time_ms(t0, t1);
+		double ns_per_elem = time_ns(t0, t1) / static_cast<double>(n);
+		std::cout << "FWHT 1M floats: " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
 	}
 
 	// Parallel FWHT bench
@@ -37,7 +43,9 @@ int main() {
 		auto t0 = clock_type::now();
 		kllm::fwht_inplace_parallel(x.data(), x.size(), pool);
 		auto t1 = clock_type::now();
-		std::cout << "FWHT(par," << threads << ") 1M floats: " << time_ms(t0, t1) << " ms" << "\n";
+		double ms = time_ms(t0, t1);
+		double ns_per_elem = time_ns(t0, t1) / static_cast<double>(n);
+		std::cout << "FWHT(par," << threads << ") 1M floats: " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
 	}
 
 	// Fused FWHT-scale-add
@@ -48,7 +56,33 @@ int main() {
 		auto t0 = clock_type::now();
 		kllm::fused_fwht_scale_add(x.data(), x.size(), 0.25f, y.data());
 		auto t1 = clock_type::now();
-		std::cout << "Fused FWHT-scale-add 1M: " << time_ms(t0, t1) << " ms" << "\n";
+		double ms = time_ms(t0, t1);
+		double ns_per_elem = time_ns(t0, t1) / static_cast<double>(n);
+		std::cout << "Fused FWHT-scale-add 1M: " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
+	}
+
+	// Micro FWHT bench (2048 elems)
+	{
+		const std::size_t n = 1 << 11;
+		std::vector<float> x(n);
+		for (float &v : x) v = dist(rng);
+		auto t0 = clock_type::now();
+		kllm::fwht_inplace(x.data(), x.size());
+		auto t1 = clock_type::now();
+		double ns = time_ns(t0, t1);
+		std::cout << "FWHT 2048 floats: " << ns << " ns (" << (ns / n) << " ns/elem)" << "\n";
+	}
+
+	// Micro fused bench (2048 elems)
+	{
+		const std::size_t n = 1 << 11;
+		std::vector<float> x(n), y(n, 0.0f);
+		for (float &v : x) v = dist(rng);
+		auto t0 = clock_type::now();
+		kllm::fused_fwht_scale_add(x.data(), x.size(), 0.125f, y.data());
+		auto t1 = clock_type::now();
+		double ns = time_ns(t0, t1);
+		std::cout << "Fused FWHT-scale-add 2048: " << ns << " ns (" << (ns / n) << " ns/elem)" << "\n";
 	}
 
 	// NTT bench
@@ -59,7 +93,9 @@ int main() {
 		auto t0 = clock_type::now();
 		kllm::ntt_inplace(a, false);
 		auto t1 = clock_type::now();
-		std::cout << "NTT 262k uint32: " << time_ms(t0, t1) << " ms" << "\n";
+		double ms = time_ms(t0, t1);
+		double ns_per_elem = time_ns(t0, t1) / static_cast<double>(n);
+		std::cout << "NTT 262k uint32: " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
 	}
 
 	// CountSketch bench
@@ -72,7 +108,9 @@ int main() {
 		auto t0 = clock_type::now();
 		cs.apply(x.data(), x.size(), out.data());
 		auto t1 = clock_type::now();
-		std::cout << "CountSketch 1M -> 262k (3 hashes): " << time_ms(t0, t1) << " ms" << "\n";
+		double ms = time_ms(t0, t1);
+		double ns_per_elem = time_ns(t0, t1) / static_cast<double>(n);
+		std::cout << "CountSketch 1M -> 262k (3 hashes): " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
 	}
 
 	// Block-diagonal float bench: 1024 blocks of 16x16 => 16384 total
@@ -91,7 +129,9 @@ int main() {
 		auto t0 = clock_type::now();
 		kllm::block_diagonal_matvec(data.data(), offsets.data(), sizes.data(), blocks, x.data(), y.data());
 		auto t1 = clock_type::now();
-		std::cout << "BlockDiag float 1024x(16x16): " << time_ms(t0, t1) << " ms" << "\n";
+		double ms = time_ms(t0, t1);
+		double ns_per_elem = time_ns(t0, t1) / static_cast<double>(total);
+		std::cout << "BlockDiag float 1024x(16x16): " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
 	}
 
 	// Block-diagonal int8 bench (mixed precision)
@@ -127,7 +167,9 @@ int main() {
 		auto t0 = clock_type::now();
 		kllm::block_diagonal_matvec_int8(q.data(), scales.data(), offsets.data(), sizes.data(), blocks, x.data(), y.data());
 		auto t1 = clock_type::now();
-		std::cout << "BlockDiag int8 1024x(16x16): " << time_ms(t0, t1) << " ms" << "\n";
+		double ms = time_ms(t0, t1);
+		double ns_per_elem = time_ns(t0, t1) / static_cast<double>(total);
+		std::cout << "BlockDiag int8 1024x(16x16): " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
 	}
 
 	// Low-rank bench: out=4096, in=4096, rank=64
@@ -140,7 +182,9 @@ int main() {
 		auto t0 = clock_type::now();
 		kllm::low_rank_apply(U.data(), V.data(), out_dim, in_dim, rank, x.data(), y.data());
 		auto t1 = clock_type::now();
-		std::cout << "LowRank 4096x4096 (r=64): " << time_ms(t0, t1) << " ms" << "\n";
+		double ms = time_ms(t0, t1);
+		double ns_per_elem = time_ns(t0, t1) / static_cast<double>(out_dim);
+		std::cout << "LowRank 4096x4096 (r=64): " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
 	}
 
 	return 0;

@@ -22,6 +22,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #if defined(__AVX2__)
 	#include <immintrin.h>
@@ -35,6 +36,13 @@
 #endif
 
 namespace kllm {
+
+// Strong inline hint for hot paths
+#if defined(__GNUC__) || defined(__clang__)
+	#define KLLM_INLINE inline __attribute__((always_inline))
+#else
+	#define KLLM_INLINE inline
+#endif
 
 // ===== utils =====
 inline bool is_power_of_two(std::size_t value) {
@@ -332,7 +340,7 @@ inline void dequantize_int8(const int8_t *input, std::size_t length, float scale
 }
 
 // ===== fast_transform (FWHT) =====
-inline void fwht_inplace(float *data, std::size_t length) {
+KLLM_INLINE void fwht_inplace(float * KLLM_RESTRICT data, std::size_t length) {
 	if (data == nullptr || !is_power_of_two(length)) {
 		return;
 	}
@@ -346,6 +354,8 @@ inline void fwht_inplace(float *data, std::size_t length) {
 			for (; i + vec_width <= half_block; i += vec_width) {
 				float *a_ptr = data + block_start + i;
 				float *b_ptr = data + block_start + i + half_block;
+				prefetch(a_ptr + 32);
+				prefetch(b_ptr + 32);
 				__m256 a = _mm256_loadu_ps(a_ptr);
 				__m256 b = _mm256_loadu_ps(b_ptr);
 				__m256 sum = _mm256_add_ps(a, b);
@@ -360,6 +370,8 @@ inline void fwht_inplace(float *data, std::size_t length) {
 			for (; i + neon_width <= half_block; i += neon_width) {
 				float *a_ptr = data + block_start + i;
 				float *b_ptr = data + block_start + i + half_block;
+				prefetch(a_ptr + 16);
+				prefetch(b_ptr + 16);
 				float32x4_t a = vld1q_f32(a_ptr);
 				float32x4_t b = vld1q_f32(b_ptr);
 				float32x4_t sum = vaddq_f32(a, b);
@@ -380,7 +392,7 @@ inline void fwht_inplace(float *data, std::size_t length) {
 	}
 }
 
-inline void fwht_inplace_parallel(float *data, std::size_t length, ThreadPool &pool) {
+KLLM_INLINE void fwht_inplace_parallel(float * KLLM_RESTRICT data, std::size_t length, ThreadPool &pool) {
 	if (data == nullptr || !is_power_of_two(length)) {
 		return;
 	}
@@ -393,6 +405,8 @@ inline void fwht_inplace_parallel(float *data, std::size_t length, ThreadPool &p
 			for (; i + vec_width <= half_block; i += vec_width) {
 				float *a_ptr = data + block_start + i;
 				float *b_ptr = data + block_start + i + half_block;
+				prefetch(a_ptr + 32);
+				prefetch(b_ptr + 32);
 				__m256 a = _mm256_loadu_ps(a_ptr);
 				__m256 b = _mm256_loadu_ps(b_ptr);
 				__m256 sum = _mm256_add_ps(a, b);
@@ -406,6 +420,8 @@ inline void fwht_inplace_parallel(float *data, std::size_t length, ThreadPool &p
 			for (; i + neon_width <= half_block; i += neon_width) {
 				float *a_ptr = data + block_start + i;
 				float *b_ptr = data + block_start + i + half_block;
+				prefetch(a_ptr + 16);
+				prefetch(b_ptr + 16);
 				float32x4_t a = vld1q_f32(a_ptr);
 				float32x4_t b = vld1q_f32(b_ptr);
 				float32x4_t sum = vaddq_f32(a, b);
@@ -426,7 +442,7 @@ inline void fwht_inplace_parallel(float *data, std::size_t length, ThreadPool &p
 	}
 }
 
-inline void fwht_inplace_inverse(float *data, std::size_t length) {
+KLLM_INLINE void fwht_inplace_inverse(float * KLLM_RESTRICT data, std::size_t length) {
 	if (data == nullptr || !is_power_of_two(length)) {
 		return;
 	}
@@ -438,19 +454,20 @@ inline void fwht_inplace_inverse(float *data, std::size_t length) {
 }
 
 // ===== fused kernels =====
-inline void fused_fwht_scale_add(const float *input, std::size_t length, float scale, float *inout_destination) {
+KLLM_INLINE void fused_fwht_scale_add(const float * KLLM_RESTRICT input, std::size_t length, float scale, float * KLLM_RESTRICT inout_destination) {
 	if (input == nullptr || inout_destination == nullptr || !is_power_of_two(length)) {
 		return;
 	}
-	std::vector<float> buffer(length);
-	for (std::size_t i = 0; i < length; ++i) {
-		buffer[i] = input[i];
-	}
+	static thread_local std::vector<float> buffer;
+	buffer.resize(length);
+	std::memcpy(buffer.data(), input, length * sizeof(float));
 	fwht_inplace(buffer.data(), length);
 	std::size_t i = 0;
 #if defined(__AVX2__)
 	const __m256 vscale = _mm256_set1_ps(scale);
 	for (; i + 8 <= length; i += 8) {
+		prefetch(buffer.data() + i + 32);
+		prefetch(inout_destination + i + 32);
 		__m256 u = _mm256_loadu_ps(buffer.data() + i);
 		__m256 acc = _mm256_loadu_ps(inout_destination + i);
 		acc = _mm256_fmadd_ps(u, vscale, acc);
@@ -460,6 +477,8 @@ inline void fused_fwht_scale_add(const float *input, std::size_t length, float s
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
 	float32x4_t vscale = vdupq_n_f32(scale);
 	for (; i + 4 <= length; i += 4) {
+		prefetch(buffer.data() + i + 16);
+		prefetch(inout_destination + i + 16);
 		float32x4_t u = vld1q_f32(buffer.data() + i);
 		float32x4_t acc = vld1q_f32(inout_destination + i);
 		acc = vmlaq_f32(acc, u, vscale);
@@ -471,16 +490,19 @@ inline void fused_fwht_scale_add(const float *input, std::size_t length, float s
 	}
 }
 
-inline void fused_fwht_bias_relu(const float *input, const float *bias, std::size_t length, float *destination) {
+KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
 	if (input == nullptr || bias == nullptr || destination == nullptr || !is_power_of_two(length)) {
 		return;
 	}
-	std::vector<float> buffer(length);
-	for (std::size_t j = 0; j < length; ++j) buffer[j] = input[j];
+	static thread_local std::vector<float> buffer;
+	buffer.resize(length);
+	std::memcpy(buffer.data(), input, length * sizeof(float));
 	fwht_inplace(buffer.data(), length);
 	std::size_t i = 0;
 #if defined(__AVX2__)
 	for (; i + 8 <= length; i += 8) {
+		prefetch(buffer.data() + i + 32);
+		prefetch(bias + i + 32);
 		__m256 u = _mm256_loadu_ps(buffer.data() + i);
 		__m256 b = _mm256_loadu_ps(bias + i);
 		__m256 y = _mm256_add_ps(u, b);
@@ -491,6 +513,8 @@ inline void fused_fwht_bias_relu(const float *input, const float *bias, std::siz
 #endif
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
 	for (; i + 4 <= length; i += 4) {
+		prefetch(buffer.data() + i + 16);
+		prefetch(bias + i + 16);
 		float32x4_t u = vld1q_f32(buffer.data() + i);
 		float32x4_t b = vld1q_f32(bias + i);
 		float32x4_t y = vaddq_f32(u, b);
@@ -630,8 +654,8 @@ struct CountSketch {
 };
 
 // ===== transform_extras =====
-inline void block_diagonal_matvec(const float *blocks_data, const std::size_t *offsets, const std::size_t *block_sizes, std::size_t num_blocks,
-	const float *x, float *y) {
+KLLM_INLINE void block_diagonal_matvec(const float * KLLM_RESTRICT blocks_data, const std::size_t * KLLM_RESTRICT offsets, const std::size_t * KLLM_RESTRICT block_sizes, std::size_t num_blocks,
+	const float * KLLM_RESTRICT x, float * KLLM_RESTRICT y) {
 	std::size_t x_offset = 0;
 	std::size_t y_offset = 0;
 	for (std::size_t b = 0; b < num_blocks; ++b) {
@@ -641,6 +665,8 @@ inline void block_diagonal_matvec(const float *blocks_data, const std::size_t *o
 			float acc = 0.0f;
 			const float *row = block + i * n;
 			for (std::size_t j = 0; j < n; ++j) {
+				prefetch(row + j + 32);
+				prefetch(x + x_offset + j + 32);
 				acc += row[j] * x[x_offset + j];
 			}
 			y[y_offset + i] = acc;
@@ -651,8 +677,8 @@ inline void block_diagonal_matvec(const float *blocks_data, const std::size_t *o
 }
 
 // Mixed-precision: int8 weights with per-block scale, accumulate in float for quality
-inline void block_diagonal_matvec_int8(const int8_t *blocks_q, const float *scales, const std::size_t *offsets, const std::size_t *block_sizes, std::size_t num_blocks,
-	const float *x, float *y) {
+KLLM_INLINE void block_diagonal_matvec_int8(const int8_t * KLLM_RESTRICT blocks_q, const float * KLLM_RESTRICT scales, const std::size_t * KLLM_RESTRICT offsets, const std::size_t * KLLM_RESTRICT block_sizes, std::size_t num_blocks,
+	const float * KLLM_RESTRICT x, float * KLLM_RESTRICT y) {
 	std::size_t x_offset = 0;
 	std::size_t y_offset = 0;
 	for (std::size_t b = 0; b < num_blocks; ++b) {
@@ -663,6 +689,8 @@ inline void block_diagonal_matvec_int8(const int8_t *blocks_q, const float *scal
 			float acc = 0.0f;
 			const int8_t *row = block + i * n;
 			for (std::size_t j = 0; j < n; ++j) {
+				prefetch(row + j + 64);
+				prefetch(x + x_offset + j + 64);
 				acc += static_cast<float>(row[j]) * s * x[x_offset + j];
 			}
 			y[y_offset + i] = acc;
@@ -672,8 +700,8 @@ inline void block_diagonal_matvec_int8(const int8_t *blocks_q, const float *scal
 	}
 }
 
-inline void low_rank_apply(const float *U, const float *V, std::size_t out_dim, std::size_t in_dim, std::size_t rank,
-	const float *x, float *y) {
+KLLM_INLINE void low_rank_apply(const float * KLLM_RESTRICT U, const float * KLLM_RESTRICT V, std::size_t out_dim, std::size_t in_dim, std::size_t rank,
+	const float * KLLM_RESTRICT x, float * KLLM_RESTRICT y) {
 	// t = V^T x => length rank
 	std::vector<float> t(rank, 0.0f);
 	for (std::size_t r = 0; r < rank; ++r) {
