@@ -167,20 +167,32 @@ inline std::unique_ptr<T, FreeDeleter> allocate_aligned(std::size_t count, std::
 	return std::unique_ptr<T, FreeDeleter>(static_cast<T *>(raw.release()));
 }
 
-inline bool set_current_thread_affinity(int cpu_index) {
+inline Status set_current_thread_affinity_status(int cpu_index) {
 	(void)cpu_index;
 #if defined(__linux__)
 	if (cpu_index < 0) {
-		return false;
+		return make_status(StatusCode::kInvalidArgument, "cpu_index must be >= 0");
 	}
+#if defined(CPU_SETSIZE)
+	if (static_cast<unsigned int>(cpu_index) >= CPU_SETSIZE) {
+		return make_status(StatusCode::kInvalidArgument, "cpu_index exceeds CPU_SETSIZE");
+	}
+#endif
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	CPU_SET(static_cast<unsigned int>(cpu_index), &set);
-	const int result = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
-	return result == 0;
+	const int result = sched_setaffinity(0, sizeof(cpu_set_t), &set);
+	if (result != 0) {
+		return make_status(StatusCode::kFailedPrecondition, "sched_setaffinity failed");
+	}
+	return Status::OK();
 #else
-	return false;
+	return make_status(StatusCode::kFailedPrecondition, "Thread affinity not supported on this platform");
 #endif
+}
+
+inline bool set_current_thread_affinity(int cpu_index) {
+	return set_current_thread_affinity_status(cpu_index).ok();
 }
 
 // ===== parallel =====
@@ -365,18 +377,12 @@ KLLM_INLINE void fwht_inplace(float * KLLM_RESTRICT data, std::size_t length) {
 				float *b_ptr = data + block_start + i + half_block;
 				prefetch(a_ptr + global_config().prefetch_distance);
 				prefetch(b_ptr + global_config().prefetch_distance);
-				__m256 a;
-				__m256 b;
-				if (is_aligned_32(a_ptr) && is_aligned_32(b_ptr)) {
-					a = _mm256_load_ps(a_ptr);
-					b = _mm256_load_ps(b_ptr);
-				} else {
-					a = _mm256_loadu_ps(a_ptr);
-					b = _mm256_loadu_ps(b_ptr);
-				}
+				const bool aligned = is_aligned_32(a_ptr) && is_aligned_32(b_ptr);
+				__m256 a = aligned ? _mm256_load_ps(a_ptr) : _mm256_loadu_ps(a_ptr);
+				__m256 b = aligned ? _mm256_load_ps(b_ptr) : _mm256_loadu_ps(b_ptr);
 				__m256 sum = _mm256_add_ps(a, b);
 				__m256 diff = _mm256_sub_ps(a, b);
-				if (is_aligned_32(a_ptr) && is_aligned_32(b_ptr)) {
+				if (aligned) {
 					_mm256_store_ps(a_ptr, sum);
 					_mm256_store_ps(b_ptr, diff);
 				} else {
@@ -656,14 +662,18 @@ inline bool ntt_inplace(std::vector<std::uint32_t> &a, bool invert) {
 		const std::uint32_t wlen = invert
 			? inv_mod(pow_mod(kPrimitiveRoot, (kMod - 1u) / static_cast<std::uint32_t>(len)))
 			: pow_mod(kPrimitiveRoot, (kMod - 1u) / static_cast<std::uint32_t>(len));
+		// Precompute stage twiddles once and reuse across blocks
+		std::vector<std::uint32_t> twiddles(half);
+		twiddles[0] = 1u;
+		for (std::size_t j = 1; j < half; ++j) {
+			twiddles[j] = mul_mod(twiddles[j - 1], wlen);
+		}
 		for (std::size_t i = 0; i < n; i += len) {
-			std::uint32_t w = 1u;
 			for (std::size_t j = 0; j < half; ++j) {
 				const std::uint32_t u = a[i + j];
-				const std::uint32_t v = mul_mod(a[i + j + half], w);
+				const std::uint32_t v = mul_mod(a[i + j + half], twiddles[j]);
 				a[i + j] = add_mod(u, v);
 				a[i + j + half] = sub_mod(u, v);
-				w = mul_mod(w, wlen);
 			}
 		}
 	}

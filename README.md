@@ -8,7 +8,7 @@ KLLM (Key-Light Large Model) is a CPU-first, C++17 header-only library providing
 - Modular NTT over 998244353 with forward/inverse
 - CountSketch for hashing-based dimension reduction
 - Fused transform-scale-add helper; new fused FWHT+bias+ReLU
-- Aligned allocation and basic thread affinity API
+- Aligned allocation and basic thread affinity API (portable via sched_setaffinity)
 - Tiny IR + planner that fuses Transform+Relu
 - int8 quantization helpers (scale selection, encode/decode)
 - Lightweight thread pool and parallel FWHT
@@ -33,7 +33,8 @@ clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC \
   -Wall -Wextra -Wpedantic -Werror \
   -I. examples/main.cpp -o kllm_demo
 
-# aarch64 (ARM64 NEON)
+# aarch64 (ARM64 NEON) / Termux on Android
+# Note: Some Android kernels restrict CPU affinity from apps; affinity calls may be no-ops.
 clang++ -std=c++17 -O3 -march=armv8-a+simd -mtune=native -fPIC \
   -Wall -Wextra -Wpedantic -Werror \
   -I. examples/main.cpp -o kllm_demo
@@ -55,6 +56,16 @@ Run:
 ./kllm_bench
 ./kllm_test
 ```
+
+---
+
+### Termux notes / troubleshooting
+- If you see an error like:
+```text
+./kklm.h:179:21: error: use of undeclared identifier 'pthread_setaffinity_np'; did you mean 'sched_setaffinity'?
+```
+Update to the latest header; CPU affinity now uses `sched_setaffinity()`. No pthread header is required.
+- Some Android ROMs restrict affinity; calls may return a failed status or be no-ops. Use `set_current_thread_affinity_status()` to inspect errors.
 
 ---
 
@@ -98,6 +109,7 @@ std::unique_ptr<void, kllm::FreeDeleter> kllm::allocate_aligned_bytes(std::size_
 template <typename T>
 std::unique_ptr<T, kllm::FreeDeleter> kllm::allocate_aligned(std::size_t count, std::size_t alignment);
 
+kllm::Status kllm::set_current_thread_affinity_status(int cpu_index);
 bool kllm::set_current_thread_affinity(int cpu_index);
 ```
 
@@ -157,7 +169,7 @@ System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features auto
 
 ### Performance Notes
 - Prefer power-of-two lengths for transforms.
-- Use `-march=native -O3`. Pin threads via `set_current_thread_affinity` for NUMA.
+- Use `-march=native -O3`. Pin threads via `set_current_thread_affinity` for NUMA. On Linux/Android, affinity uses `sched_setaffinity()`; returns detailed `Status` via `set_current_thread_affinity_status`.
 - Keep working sets within L1/L2; consider tiling at the call site.
 - Fuse downstream pointwise ops with transforms (see IR planner) to reduce memory traffic.
 - For int8 paths, pack/accumulate in int32 and dequantize late; batch operations for better cache locality.
