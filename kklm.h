@@ -49,6 +49,10 @@ inline bool is_power_of_two(std::size_t value) {
 	return value != 0 && (value & (value - 1)) == 0;
 }
 
+inline bool is_aligned_32(const void *ptr) {
+	return (reinterpret_cast<std::uintptr_t>(ptr) & 31u) == 0u;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 	#define KLLM_LIKELY(x) (__builtin_expect(!!(x), 1))
 	#define KLLM_UNLIKELY(x) (__builtin_expect(!!(x), 0))
@@ -111,6 +115,7 @@ inline Status make_status(StatusCode code, const char *msg) {
 struct Config {
 	bool deterministic = false;
 	std::size_t num_threads = 0; // 0 => use hardware_concurrency
+	std::size_t prefetch_distance = 32; // elements ahead for prefetching (floats)
 };
 
 inline Config & global_config() {
@@ -124,6 +129,10 @@ inline void set_deterministic(bool enabled) {
 
 inline void set_num_threads(std::size_t n) {
 	global_config().num_threads = n;
+}
+
+inline void set_prefetch_distance(std::size_t elements_ahead) {
+	global_config().prefetch_distance = elements_ahead;
 }
 
 // ===== memory =====
@@ -354,14 +363,26 @@ KLLM_INLINE void fwht_inplace(float * KLLM_RESTRICT data, std::size_t length) {
 			for (; i + vec_width <= half_block; i += vec_width) {
 				float *a_ptr = data + block_start + i;
 				float *b_ptr = data + block_start + i + half_block;
-				prefetch(a_ptr + 32);
-				prefetch(b_ptr + 32);
-				__m256 a = _mm256_loadu_ps(a_ptr);
-				__m256 b = _mm256_loadu_ps(b_ptr);
+				prefetch(a_ptr + global_config().prefetch_distance);
+				prefetch(b_ptr + global_config().prefetch_distance);
+				__m256 a;
+				__m256 b;
+				if (is_aligned_32(a_ptr) && is_aligned_32(b_ptr)) {
+					a = _mm256_load_ps(a_ptr);
+					b = _mm256_load_ps(b_ptr);
+				} else {
+					a = _mm256_loadu_ps(a_ptr);
+					b = _mm256_loadu_ps(b_ptr);
+				}
 				__m256 sum = _mm256_add_ps(a, b);
 				__m256 diff = _mm256_sub_ps(a, b);
-				_mm256_storeu_ps(a_ptr, sum);
-				_mm256_storeu_ps(b_ptr, diff);
+				if (is_aligned_32(a_ptr) && is_aligned_32(b_ptr)) {
+					_mm256_store_ps(a_ptr, sum);
+					_mm256_store_ps(b_ptr, diff);
+				} else {
+					_mm256_storeu_ps(a_ptr, sum);
+					_mm256_storeu_ps(b_ptr, diff);
+				}
 			}
 #endif
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
@@ -370,8 +391,8 @@ KLLM_INLINE void fwht_inplace(float * KLLM_RESTRICT data, std::size_t length) {
 			for (; i + neon_width <= half_block; i += neon_width) {
 				float *a_ptr = data + block_start + i;
 				float *b_ptr = data + block_start + i + half_block;
-				prefetch(a_ptr + 16);
-				prefetch(b_ptr + 16);
+				prefetch(a_ptr + global_config().prefetch_distance);
+				prefetch(b_ptr + global_config().prefetch_distance);
 				float32x4_t a = vld1q_f32(a_ptr);
 				float32x4_t b = vld1q_f32(b_ptr);
 				float32x4_t sum = vaddq_f32(a, b);
@@ -405,8 +426,8 @@ KLLM_INLINE void fwht_inplace_parallel(float * KLLM_RESTRICT data, std::size_t l
 			for (; i + vec_width <= half_block; i += vec_width) {
 				float *a_ptr = data + block_start + i;
 				float *b_ptr = data + block_start + i + half_block;
-				prefetch(a_ptr + 32);
-				prefetch(b_ptr + 32);
+				prefetch(a_ptr + global_config().prefetch_distance);
+				prefetch(b_ptr + global_config().prefetch_distance);
 				__m256 a = _mm256_loadu_ps(a_ptr);
 				__m256 b = _mm256_loadu_ps(b_ptr);
 				__m256 sum = _mm256_add_ps(a, b);
@@ -420,8 +441,8 @@ KLLM_INLINE void fwht_inplace_parallel(float * KLLM_RESTRICT data, std::size_t l
 			for (; i + neon_width <= half_block; i += neon_width) {
 				float *a_ptr = data + block_start + i;
 				float *b_ptr = data + block_start + i + half_block;
-				prefetch(a_ptr + 16);
-				prefetch(b_ptr + 16);
+				prefetch(a_ptr + global_config().prefetch_distance);
+				prefetch(b_ptr + global_config().prefetch_distance);
 				float32x4_t a = vld1q_f32(a_ptr);
 				float32x4_t b = vld1q_f32(b_ptr);
 				float32x4_t sum = vaddq_f32(a, b);
@@ -466,8 +487,8 @@ KLLM_INLINE void fused_fwht_scale_add(const float * KLLM_RESTRICT input, std::si
 #if defined(__AVX2__)
 	const __m256 vscale = _mm256_set1_ps(scale);
 	for (; i + 8 <= length; i += 8) {
-		prefetch(buffer.data() + i + 32);
-		prefetch(inout_destination + i + 32);
+		prefetch(buffer.data() + i + global_config().prefetch_distance);
+		prefetch(inout_destination + i + global_config().prefetch_distance);
 		__m256 u = _mm256_loadu_ps(buffer.data() + i);
 		__m256 acc = _mm256_loadu_ps(inout_destination + i);
 		acc = _mm256_fmadd_ps(u, vscale, acc);
@@ -477,8 +498,8 @@ KLLM_INLINE void fused_fwht_scale_add(const float * KLLM_RESTRICT input, std::si
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
 	float32x4_t vscale = vdupq_n_f32(scale);
 	for (; i + 4 <= length; i += 4) {
-		prefetch(buffer.data() + i + 16);
-		prefetch(inout_destination + i + 16);
+		prefetch(buffer.data() + i + global_config().prefetch_distance);
+		prefetch(inout_destination + i + global_config().prefetch_distance);
 		float32x4_t u = vld1q_f32(buffer.data() + i);
 		float32x4_t acc = vld1q_f32(inout_destination + i);
 		acc = vmlaq_f32(acc, u, vscale);
@@ -501,8 +522,8 @@ KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const f
 	std::size_t i = 0;
 #if defined(__AVX2__)
 	for (; i + 8 <= length; i += 8) {
-		prefetch(buffer.data() + i + 32);
-		prefetch(bias + i + 32);
+		prefetch(buffer.data() + i + global_config().prefetch_distance);
+		prefetch(bias + i + global_config().prefetch_distance);
 		__m256 u = _mm256_loadu_ps(buffer.data() + i);
 		__m256 b = _mm256_loadu_ps(bias + i);
 		__m256 y = _mm256_add_ps(u, b);
@@ -513,8 +534,8 @@ KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const f
 #endif
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
 	for (; i + 4 <= length; i += 4) {
-		prefetch(buffer.data() + i + 16);
-		prefetch(bias + i + 16);
+		prefetch(buffer.data() + i + global_config().prefetch_distance);
+		prefetch(bias + i + global_config().prefetch_distance);
 		float32x4_t u = vld1q_f32(buffer.data() + i);
 		float32x4_t b = vld1q_f32(bias + i);
 		float32x4_t y = vaddq_f32(u, b);
@@ -527,6 +548,47 @@ KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const f
 		float y = buffer[i] + bias[i];
 		destination[i] = y < 0.0f ? 0.0f : y;
 	}
+}
+
+KLLM_INLINE void fused_fwht_bias_gelu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
+	if (input == nullptr || bias == nullptr || destination == nullptr || !is_power_of_two(length)) {
+		return;
+	}
+	static thread_local std::vector<float> buffer;
+	buffer.resize(length);
+	std::memcpy(buffer.data(), input, length * sizeof(float));
+	fwht_inplace(buffer.data(), length);
+	for (std::size_t i = 0; i < length; ++i) {
+		float x = buffer[i] + bias[i];
+		float t = x * (0.7978845608028654f) * (1.0f + 0.044715f * x * x); // sqrt(2/pi)
+		float y = 0.5f * x * (1.0f + std::tanh(t));
+		destination[i] = y;
+	}
+}
+
+KLLM_INLINE void fused_fwht_bias_silu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
+	if (input == nullptr || bias == nullptr || destination == nullptr || !is_power_of_two(length)) {
+		return;
+	}
+	static thread_local std::vector<float> buffer;
+	buffer.resize(length);
+	std::memcpy(buffer.data(), input, length * sizeof(float));
+	fwht_inplace(buffer.data(), length);
+	for (std::size_t i = 0; i < length; ++i) {
+		float x = buffer[i] + bias[i];
+		float s = 1.0f / (1.0f + std::exp(-x));
+		destination[i] = x * s; // swish
+	}
+}
+
+KLLM_INLINE float l2_norm(const float * KLLM_RESTRICT x, std::size_t length) {
+	if (x == nullptr) return 0.0f;
+	double acc = 0.0;
+	for (std::size_t i = 0; i < length; ++i) {
+		double v = static_cast<double>(x[i]);
+		acc += v * v;
+	}
+	return static_cast<float>(std::sqrt(acc));
 }
 
 // ===== NTT =====
@@ -919,6 +981,30 @@ inline Status fused_transform_bias_relu(const std::vector<float> &input, const s
 	}
 	out.resize(input.size());
 	fused_fwht_bias_relu(input.data(), bias.data(), input.size(), out.data());
+	return Status::OK();
+}
+
+inline Status fused_transform_bias_gelu(const std::vector<float> &input, const std::vector<float> &bias, std::vector<float> &out) {
+	if (input.size() != bias.size()) {
+		return make_status(StatusCode::kInvalidArgument, "Input and bias must have same size");
+	}
+	if (!is_power_of_two(input.size())) {
+		return make_status(StatusCode::kInvalidArgument, "Input length must be power of two");
+	}
+	out.resize(input.size());
+	fused_fwht_bias_gelu(input.data(), bias.data(), input.size(), out.data());
+	return Status::OK();
+}
+
+inline Status fused_transform_bias_silu(const std::vector<float> &input, const std::vector<float> &bias, std::vector<float> &out) {
+	if (input.size() != bias.size()) {
+		return make_status(StatusCode::kInvalidArgument, "Input and bias must have same size");
+	}
+	if (!is_power_of_two(input.size())) {
+		return make_status(StatusCode::kInvalidArgument, "Input length must be power of two");
+	}
+	out.resize(input.size());
+	fused_fwht_bias_silu(input.data(), bias.data(), input.size(), out.data());
 	return Status::OK();
 }
 

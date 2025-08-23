@@ -54,6 +54,18 @@ static void test_fused() {
 	std::cout << "Fused FWHT-scale-add checksum: " << checksum << "\n";
 }
 
+static void test_fused_extra() {
+	std::vector<float> src(8);
+	for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<float>(i) - 4.0f;
+	std::vector<float> bias(8, 0.1f);
+	std::vector<float> out1(8), out2(8);
+	kllm::fused_fwht_bias_gelu(src.data(), bias.data(), src.size(), out1.data());
+	kllm::fused_fwht_bias_silu(src.data(), bias.data(), src.size(), out2.data());
+	float n1 = kllm::l2_norm(out1.data(), out1.size());
+	float n2 = kllm::l2_norm(out2.data(), out2.size());
+	std::cout << "Fused GELU/SiLU norms: " << n1 << ", " << n2 << "\n";
+}
+
 static void test_simple_bias_relu() {
 	std::vector<float> x(8);
 	std::vector<float> b(8, 0.5f);
@@ -148,6 +160,7 @@ int main() {
 	test_ntt();
 	test_countsketch();
 	test_fused();
+	test_fused_extra();
 	test_simple_bias_relu();
 	test_quant();
 	test_rewards();
