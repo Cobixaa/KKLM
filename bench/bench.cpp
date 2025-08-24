@@ -3,6 +3,8 @@
 #include <chrono>
 #include <random>
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 
 #include "kklm.h"
 
@@ -189,6 +191,13 @@ int main() {
 
 	// v2.1 pipeline bench (int8)
 	{
+		const char *gpu_env = std::getenv("KLLM_GPU");
+		if (gpu_env && std::string(gpu_env) == "1") { kllm::set_enable_gpu(true); }
+		// Tune pipeline for LargeN
+		kllm::set_large_slab_bytes(1024 * 1024); // 1 MB slabs
+		kllm::set_max_inflight_slabs(3);
+		// Cap threads to reduce overhead and memory for sketch parallelism
+		kllm::set_num_threads(std::min<unsigned>(8u, std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 8u));
 		const std::size_t n = 1 << 20;
 		std::vector<float> x(n);
 		for (float &v : x) v = dist(rng);
@@ -197,7 +206,8 @@ int main() {
 		kllm::run_pipeline_v21_to_int8(x, 1 << 18, q8, sc, t, kllm::PointwiseOp::kRelu);
 		auto t1 = clock_type::now();
 		double ms = time_ms(t0, t1);
-		std::cout << "Pipeline v2.1 int8 1M: " << ms << " ms, slabs=" << t.slabs_processed << "\n";
+		std::cout << "Pipeline v2.1 int8 1M: " << ms << " ms, slabs=" << t.slabs_processed
+			<< " (stage0=" << t.ms_stage0 << ", stage1=" << t.ms_stage1 << ", stage2=" << t.ms_stage2 << ")\n";
 	}
 
 	// v2.1 pipeline bench (int4)
@@ -210,7 +220,8 @@ int main() {
 		kllm::run_pipeline_v21_to_int4(x, 1 << 18, q4, sc, t, kllm::PointwiseOp::kRelu);
 		auto t1 = clock_type::now();
 		double ms = time_ms(t0, t1);
-		std::cout << "Pipeline v2.1 int4 1M: " << ms << " ms, slabs=" << t.slabs_processed << "\n";
+		std::cout << "Pipeline v2.1 int4 1M: " << ms << " ms, slabs=" << t.slabs_processed
+			<< " (stage0=" << t.ms_stage0 << ", stage1=" << t.ms_stage1 << ", stage2=" << t.ms_stage2 << ")\n";
 	}
 
 	return 0;
