@@ -176,18 +176,18 @@ System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features auto
 
 ### Benchmarks (sample on this environment)
 ```
-FWHT 1M floats: 8.33 ms
-FWHT(par,4) 1M floats: 3.90 ms
-Fused FWHT-scale-add 1M: 7.92 ms
-FWHT 2048 floats: 12.9 us
-Fused FWHT-scale-add 2048: 13.5 us
-NTT 262k uint32: 4.46 ms
-CountSketch 1M -> 262k (3 hashes): 4.13 ms
-BlockDiag float 1024x(16x16): 0.052 ms
-BlockDiag int8 1024x(16x16): 0.047 ms
-LowRank 4096x4096 (r=64): ~0 ms
-Pipeline v2.1 int8 1M: ~X ms (depends on CPU), slabs=~4
-Pipeline v2.1 int4 1M: ~X ms (depends on CPU), slabs=~4
+FWHT 1M floats: 8.24545 ms
+FWHT(par,4) 1M floats: 3.61539 ms
+Fused FWHT-scale-add 1M: 6.67958 ms
+FWHT 2048 floats: 12762 ns
+Fused FWHT-scale-add 2048: 13394 ns
+NTT 262k uint32: 4.44111 ms
+CountSketch 1M -> 262k (3 hashes): 4.43309 ms
+BlockDiag float 1024x(16x16): 0.047842 ms
+BlockDiag int8 1024x(16x16): 0.0464 ms
+LowRank 4096x4096 (r=64): 3.1e-05 ms
+Pipeline v2.1 int8 1M: 28.6805 ms, slabs=16
+Pipeline v2.1 int4 1M: 28.9056 ms, slabs=16
 ```
 Targets: -20 ms vs baseline at N≈1,048,576 and flat throughput from 64K→1M+.
 
