@@ -187,5 +187,31 @@ int main() {
 		std::cout << "LowRank 4096x4096 (r=64): " << ms << " ms (" << ns_per_elem << " ns/elem)" << "\n";
 	}
 
+	// v2.1 pipeline bench (int8)
+	{
+		const std::size_t n = 1 << 20;
+		std::vector<float> x(n);
+		for (float &v : x) v = dist(rng);
+		kllm::PipelineTelemetry t{}; std::vector<int8_t> q8; std::vector<float> sc;
+		auto t0 = clock_type::now();
+		kllm::run_pipeline_v21_to_int8(x, 1 << 18, q8, sc, t, kllm::PointwiseOp::kRelu);
+		auto t1 = clock_type::now();
+		double ms = time_ms(t0, t1);
+		std::cout << "Pipeline v2.1 int8 1M: " << ms << " ms, slabs=" << t.slabs_processed << "\n";
+	}
+
+	// v2.1 pipeline bench (int4)
+	{
+		const std::size_t n = 1 << 20;
+		std::vector<float> x(n);
+		for (float &v : x) v = dist(rng);
+		kllm::PipelineTelemetry t{}; std::vector<uint8_t> q4; std::vector<float> sc;
+		auto t0 = clock_type::now();
+		kllm::run_pipeline_v21_to_int4(x, 1 << 18, q4, sc, t, kllm::PointwiseOp::kRelu);
+		auto t1 = clock_type::now();
+		double ms = time_ms(t0, t1);
+		std::cout << "Pipeline v2.1 int4 1M: " << ms << " ms, slabs=" << t.slabs_processed << "\n";
+	}
+
 	return 0;
 }

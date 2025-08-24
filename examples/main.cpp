@@ -155,6 +155,22 @@ static void test_training() {
 	std::cout << "Training step loss: " << res.loss << ", param0: " << params[0] << "\n";
 }
 
+static void test_pipeline_v21() {
+	std::vector<float> x(1 << 16);
+	std::mt19937 rng(123);
+	std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+	for (float &v : x) v = dist(rng);
+	kllm::PipelineTelemetry t{};
+	std::vector<int8_t> q8; std::vector<float> sc8; std::vector<uint8_t> q4; std::vector<float> sc4;
+	auto st1 = kllm::run_pipeline_v21_to_int8(x, 1 << 14, q8, sc8, t, kllm::PointwiseOp::kRelu);
+	if (!st1.ok()) std::cout << "pipeline v2.1 int8 error: " << st1.message << "\n";
+	std::cout << "Pipeline v2.1 int8: slabs=" << t.slabs_processed << ", ms_total=" << t.ms_total << "\n";
+	kllm::PipelineTelemetry t2{};
+	auto st2 = kllm::run_pipeline_v21_to_int4(x, 1 << 14, q4, sc4, t2, kllm::PointwiseOp::kRelu);
+	if (!st2.ok()) std::cout << "pipeline v2.1 int4 error: " << st2.message << "\n";
+	std::cout << "Pipeline v2.1 int4: slabs=" << t2.slabs_processed << ", ms_total=" << t2.ms_total << "\n";
+}
+
 int main() {
 	test_fwht();
 	test_ntt();
@@ -168,5 +184,6 @@ int main() {
 	test_transforms_extras();
 	test_config_and_onnx();
 	test_training();
+	test_pipeline_v21();
 	return 0;
 }

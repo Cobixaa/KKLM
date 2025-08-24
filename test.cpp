@@ -100,6 +100,24 @@ static void test_lowrank_and_blocks() {
 	if (!std::isfinite(sum2)) { ++failures; std::cout << "block_diag non-finite\n"; }
 }
 
+static void test_pipeline_v21_basic() {
+	std::vector<float> x(1 << 16);
+	std::mt19937 rng(17);
+	std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+	for (float &v : x) v = d(rng);
+	kllm::PipelineTelemetry t{}; std::vector<int8_t> q8; std::vector<float> sc;
+	auto st = kllm::run_pipeline_v21_to_int8(x, 1 << 12, q8, sc, t, kllm::PointwiseOp::kRelu);
+	if (!st.ok()) { ++failures; std::cout << "pipeline v2.1 status not OK\n"; }
+	if (q8.empty() || sc.empty()) { ++failures; std::cout << "pipeline v2.1 empty outputs\n"; }
+	float sum_sc = 0.0f; for (float v : sc) sum_sc += v; if (!std::isfinite(sum_sc)) { ++failures; std::cout << "pipeline v2.1 scales non-finite\n"; }
+	kllm::set_deterministic(true);
+	kllm::PipelineTelemetry t2{}; std::vector<int8_t> q8b; std::vector<float> scb;
+	auto st2 = kllm::run_pipeline_v21_to_int8(x, 1 << 12, q8b, scb, t2, kllm::PointwiseOp::kRelu);
+	if (!st2.ok()) { ++failures; std::cout << "pipeline v2.1 det status not OK\n"; }
+	if (q8b.size() == 0 || scb.size() == 0) { ++failures; std::cout << "pipeline v2.1 det empty outputs\n"; }
+	kllm::set_deterministic(false);
+}
+
 int main() {
 	test_fwht_roundtrip();
 	test_ntt_roundtrip();
@@ -108,6 +126,7 @@ int main() {
 	test_quantization();
 	test_ir_and_scheduler();
 	test_lowrank_and_blocks();
+	test_pipeline_v21_basic();
 	if (failures == 0) {
 		std::cout << "ALL TESTS PASSED\n";
 		return 0;
