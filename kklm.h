@@ -494,8 +494,16 @@ inline void dequantize_int8(const int8_t *input, std::size_t length, float scale
 }
 
 // ===== fast_transform (FWHT) =====
+KLLM_INLINE void fwht_inplace_parallel(float * KLLM_RESTRICT data, std::size_t length, ThreadPool &pool);
 KLLM_INLINE void fwht_inplace(float * KLLM_RESTRICT data, std::size_t length) {
 	if (data == nullptr || !is_power_of_two(length)) {
+		return;
+	}
+	// Auto-parallelize for large inputs
+	if (length >= global_config().parallel_threshold) {
+		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+		ThreadPool &pool = get_thread_local_pool(threads);
+		fwht_inplace_parallel(data, length, pool);
 		return;
 	}
 	for (std::size_t half_block = 1; half_block < length; half_block <<= 1) {
