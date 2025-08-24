@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cerrno>
+#include <cstdio>
 
 #if defined(__AVX2__)
 	#include <immintrin.h>
@@ -111,11 +113,64 @@ inline Status make_status(StatusCode code, const char *msg) {
 	return Status{code, msg};
 }
 
+// Thread-local small buffer for error messages that include errno or dynamic details.
+// The returned c_str pointers are valid until the calling thread overwrites them with a new call.
+inline const char * make_status_message(const char *base, const char *detail = nullptr, int errnum = 0) {
+	static thread_local char buf[256];
+	if (detail && errnum != 0) {
+		std::snprintf(buf, sizeof(buf), "%s: %s (errno=%d)", base, detail, errnum);
+	} else if (detail) {
+		std::snprintf(buf, sizeof(buf), "%s: %s", base, detail);
+	} else if (errnum != 0) {
+		const char *emsg = std::strerror(errnum);
+		std::snprintf(buf, sizeof(buf), "%s: %s (errno=%d)", base, emsg ? emsg : "?", errnum);
+	} else {
+		std::snprintf(buf, sizeof(buf), "%s", base);
+	}
+	return buf;
+}
+
+inline Status make_status_errno(StatusCode code, const char *base, int errnum) {
+	return make_status(code, make_status_message(base, nullptr, errnum));
+}
+
+// Lightweight StatusOr to propagate values or errors without exceptions.
+template <typename T>
+class StatusOr {
+public:
+	StatusOr(const Status &s) : status_(s), has_value_(false) {}
+	StatusOr(T &&value) : status_(Status::OK()), has_value_(true) {
+		new (&storage_) T(std::move(value));
+	}
+	StatusOr(const T &value) : status_(Status::OK()), has_value_(true) {
+		new (&storage_) T(value);
+	}
+	~StatusOr() { if (has_value_) { reinterpret_cast<T*>(&storage_)->~T(); } }
+
+	bool ok() const { return status_.ok(); }
+	const Status & status() const { return status_; }
+	T & value() { return *reinterpret_cast<T*>(&storage_); }
+	const T & value() const { return *reinterpret_cast<const T*>(&storage_); }
+
+private:
+	Status status_;
+	bool has_value_;
+	typename std::aligned_storage<sizeof(T), alignof(T)>::type storage_;
+};
+
+#define KLLM_RETURN_IF_FALSE(cond, code, msg) \
+	do { if (KLLM_UNLIKELY(!(cond))) { return make_status((code), (msg)); } } while(0)
+
+#define KLLM_RETURN_IF_ERROR(expr) \
+	do { Status _st = (expr); if (KLLM_UNLIKELY(!_st.ok())) return _st; } while(0)
+
 // ===== config =====
 struct Config {
 	bool deterministic = false;
 	std::size_t num_threads = 0; // 0 => use hardware_concurrency
 	std::size_t prefetch_distance = 32; // elements ahead for prefetching (floats)
+	std::size_t parallel_threshold = 1 << 14; // use parallel paths when length >= threshold
+	bool pin_threads = false; // try to pin worker threads to cores on Linux
 };
 
 inline Config & global_config() {
@@ -133,6 +188,14 @@ inline void set_num_threads(std::size_t n) {
 
 inline void set_prefetch_distance(std::size_t elements_ahead) {
 	global_config().prefetch_distance = elements_ahead;
+}
+
+inline void set_parallel_threshold(std::size_t threshold) {
+	global_config().parallel_threshold = threshold;
+}
+
+inline void set_pin_threads(bool pin) {
+	global_config().pin_threads = pin;
 }
 
 // ===== memory =====
@@ -160,6 +223,28 @@ inline std::unique_ptr<void, FreeDeleter> allocate_aligned_bytes(std::size_t siz
 #endif
 }
 
+inline StatusOr<std::unique_ptr<void, FreeDeleter>> allocate_aligned_bytes_status(std::size_t size_bytes, std::size_t alignment) {
+	if (alignment < alignof(void *)) alignment = alignof(void *);
+	if (size_bytes == 0) {
+		return StatusOr<std::unique_ptr<void, FreeDeleter>>(make_status(StatusCode::kInvalidArgument, "allocate_aligned_bytes: size_bytes must be > 0"));
+	}
+	void *ptr = nullptr;
+#if defined(_POSIX_VERSION)
+	int rc = posix_memalign(&ptr, alignment, size_bytes);
+	if (rc != 0) {
+		return StatusOr<std::unique_ptr<void, FreeDeleter>>(make_status_errno(StatusCode::kFailedPrecondition, "posix_memalign failed", rc));
+	}
+	return std::unique_ptr<void, FreeDeleter>(ptr);
+#else
+	std::size_t rounded = (size_bytes + alignment - 1u) / alignment * alignment;
+	ptr = std::aligned_alloc(alignment, rounded);
+	if (!ptr) {
+		return StatusOr<std::unique_ptr<void, FreeDeleter>>(make_status(StatusCode::kFailedPrecondition, "aligned_alloc failed"));
+	}
+	return std::unique_ptr<void, FreeDeleter>(ptr);
+#endif
+}
+
 template <typename T>
 inline std::unique_ptr<T, FreeDeleter> allocate_aligned(std::size_t count, std::size_t alignment) {
 	const std::size_t total = count * sizeof(T);
@@ -183,7 +268,7 @@ inline Status set_current_thread_affinity_status(int cpu_index) {
 	CPU_SET(static_cast<unsigned int>(cpu_index), &set);
 	const int result = sched_setaffinity(0, sizeof(cpu_set_t), &set);
 	if (result != 0) {
-		return make_status(StatusCode::kFailedPrecondition, "sched_setaffinity failed");
+		return make_status_errno(StatusCode::kFailedPrecondition, "sched_setaffinity failed", errno);
 	}
 	return Status::OK();
 #else
@@ -198,11 +283,17 @@ inline bool set_current_thread_affinity(int cpu_index) {
 // ===== parallel =====
 class ThreadPool {
 public:
-	explicit ThreadPool(std::size_t num_threads) : stop_flag(false), outstanding_tasks(0) {
+	explicit ThreadPool(std::size_t num_threads) : stop_flag(false), outstanding_tasks(0)
+		, pin_workers(global_config().pin_threads) {
 		if (num_threads == 0) num_threads = 1;
 		workers.reserve(num_threads);
 		for (std::size_t i = 0; i < num_threads; ++i) {
-			workers.emplace_back([this]() { this->worker_loop(); });
+			workers.emplace_back([this, i]() {
+				if (pin_workers) {
+					(void)set_current_thread_affinity(static_cast<int>(i));
+				}
+				this->worker_loop();
+			});
 		}
 	}
 
@@ -231,6 +322,11 @@ public:
 		done_cv.wait(lock, [this]() { return outstanding_tasks.load() == 0; });
 	}
 
+	bool wait_for(std::chrono::milliseconds timeout) {
+		std::unique_lock<std::mutex> lock(done_mutex);
+		return done_cv.wait_for(lock, timeout, [this]() { return outstanding_tasks.load() == 0; });
+	}
+
 	std::size_t size() const { return workers.size(); }
 
 private:
@@ -244,7 +340,11 @@ private:
 				task = std::move(tasks.front());
 				tasks.pop();
 			}
-			task();
+			try {
+				task();
+			} catch (...) {
+				// Swallow exceptions to keep thread alive; mark task done.
+			}
 			if (outstanding_tasks.fetch_sub(1) == 1) {
 				std::lock_guard<std::mutex> g(done_mutex);
 				done_cv.notify_all();
@@ -260,6 +360,7 @@ private:
 	std::atomic<std::size_t> outstanding_tasks;
 	std::condition_variable done_cv;
 	std::mutex done_mutex;
+	bool pin_workers;
 };
 
 inline void parallel_for_blocks(ThreadPool &pool, std::size_t begin, std::size_t end, std::size_t step, std::function<void(std::size_t)> fn) {
@@ -280,6 +381,17 @@ inline void parallel_for_blocks(ThreadPool &pool, std::size_t begin, std::size_t
 		start_iter += this_iters;
 	}
 	pool.wait();
+}
+
+// Thread-local pool reuse to avoid repeated construction costs on hot fused paths.
+inline ThreadPool & get_thread_local_pool(std::size_t requested_threads) {
+	thread_local std::unique_ptr<ThreadPool> pool;
+	thread_local std::size_t configured_threads = 0;
+	if (!pool || configured_threads != requested_threads) {
+		pool.reset(new ThreadPool(requested_threads));
+		configured_threads = requested_threads;
+	}
+	return *pool;
 }
 
 // ===== quant =====
@@ -434,12 +546,18 @@ KLLM_INLINE void fwht_inplace_parallel(float * KLLM_RESTRICT data, std::size_t l
 				float *b_ptr = data + block_start + i + half_block;
 				prefetch(a_ptr + global_config().prefetch_distance);
 				prefetch(b_ptr + global_config().prefetch_distance);
-				__m256 a = _mm256_loadu_ps(a_ptr);
-				__m256 b = _mm256_loadu_ps(b_ptr);
+				const bool aligned = is_aligned_32(a_ptr) && is_aligned_32(b_ptr);
+				__m256 a = aligned ? _mm256_load_ps(a_ptr) : _mm256_loadu_ps(a_ptr);
+				__m256 b = aligned ? _mm256_load_ps(b_ptr) : _mm256_loadu_ps(b_ptr);
 				__m256 sum = _mm256_add_ps(a, b);
 				__m256 diff = _mm256_sub_ps(a, b);
-				_mm256_storeu_ps(a_ptr, sum);
-				_mm256_storeu_ps(b_ptr, diff);
+				if (aligned) {
+					_mm256_store_ps(a_ptr, sum);
+					_mm256_store_ps(b_ptr, diff);
+				} else {
+					_mm256_storeu_ps(a_ptr, sum);
+					_mm256_storeu_ps(b_ptr, diff);
+				}
 			}
 #endif
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
@@ -488,7 +606,15 @@ KLLM_INLINE void fused_fwht_scale_add(const float * KLLM_RESTRICT input, std::si
 	static thread_local std::vector<float> buffer;
 	buffer.resize(length);
 	std::memcpy(buffer.data(), input, length * sizeof(float));
-	fwht_inplace(buffer.data(), length);
+	// Use parallel FWHT for large inputs when configured.
+	const bool use_parallel = (length >= global_config().parallel_threshold);
+	if (use_parallel) {
+		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+		ThreadPool &pool = get_thread_local_pool(threads);
+		fwht_inplace_parallel(buffer.data(), length, pool);
+	} else {
+		fwht_inplace(buffer.data(), length);
+	}
 	std::size_t i = 0;
 #if defined(__AVX2__)
 	const __m256 vscale = _mm256_set1_ps(scale);
@@ -524,7 +650,14 @@ KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const f
 	static thread_local std::vector<float> buffer;
 	buffer.resize(length);
 	std::memcpy(buffer.data(), input, length * sizeof(float));
-	fwht_inplace(buffer.data(), length);
+	// Use parallel FWHT for large inputs when configured.
+	if (length >= global_config().parallel_threshold) {
+		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+		ThreadPool &pool = get_thread_local_pool(threads);
+		fwht_inplace_parallel(buffer.data(), length, pool);
+	} else {
+		fwht_inplace(buffer.data(), length);
+	}
 	std::size_t i = 0;
 #if defined(__AVX2__)
 	for (; i + 8 <= length; i += 8) {
@@ -563,7 +696,13 @@ KLLM_INLINE void fused_fwht_bias_gelu(const float * KLLM_RESTRICT input, const f
 	static thread_local std::vector<float> buffer;
 	buffer.resize(length);
 	std::memcpy(buffer.data(), input, length * sizeof(float));
-	fwht_inplace(buffer.data(), length);
+	if (length >= global_config().parallel_threshold) {
+		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+		ThreadPool &pool = get_thread_local_pool(threads);
+		fwht_inplace_parallel(buffer.data(), length, pool);
+	} else {
+		fwht_inplace(buffer.data(), length);
+	}
 	for (std::size_t i = 0; i < length; ++i) {
 		float x = buffer[i] + bias[i];
 		float t = x * (0.7978845608028654f) * (1.0f + 0.044715f * x * x); // sqrt(2/pi)
@@ -579,7 +718,13 @@ KLLM_INLINE void fused_fwht_bias_silu(const float * KLLM_RESTRICT input, const f
 	static thread_local std::vector<float> buffer;
 	buffer.resize(length);
 	std::memcpy(buffer.data(), input, length * sizeof(float));
-	fwht_inplace(buffer.data(), length);
+	if (length >= global_config().parallel_threshold) {
+		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+		ThreadPool &pool = get_thread_local_pool(threads);
+		fwht_inplace_parallel(buffer.data(), length, pool);
+	} else {
+		fwht_inplace(buffer.data(), length);
+	}
 	for (std::size_t i = 0; i < length; ++i) {
 		float x = buffer[i] + bias[i];
 		float s = 1.0f / (1.0f + std::exp(-x));
