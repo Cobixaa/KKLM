@@ -27,6 +27,8 @@
 #include <cstdio>
 #include <random>
 #include <ostream>
+#include <iostream>
+#include <sstream>
 
 #if defined(__AVX2__)
 	#include <immintrin.h>
@@ -180,8 +182,7 @@ struct Config {
 	bool enable_pipeline_nt_stores = true; // allow non-temporal stores at pipeline edges
 	std::size_t sketch_num_hashes = 3; // CountSketch hashes for v2 path
 	std::size_t routing_bucket_size = 256; // elements per routing bucket (approx L2 tile)
-	// v2.2 additions
-	bool enable_gpu = false; // optional GPU backend toggles (requires compile-time support)
+	// v2.2 additions (GPU removed; CPU-only)
 };
 
 inline Config & global_config() {
@@ -216,8 +217,7 @@ inline void set_prefer_hugepages(bool enable) { global_config().prefer_hugepages
 inline void set_pipeline_nt_stores(bool enable) { global_config().enable_pipeline_nt_stores = enable; }
 inline void set_sketch_num_hashes(std::size_t h) { global_config().sketch_num_hashes = (h < 1 ? 1 : (h > 4 ? 4 : h)); }
 inline void set_routing_bucket_size(std::size_t b) { global_config().routing_bucket_size = (b == 0 ? 256 : b); }
-// v2.2 setter
-inline void set_enable_gpu(bool enable) { global_config().enable_gpu = enable; }
+// GPU setter removed; CPU-only
 
 // ===== memory =====
 struct FreeDeleter {
@@ -493,17 +493,18 @@ inline void dequantize_int8(const int8_t *input, std::size_t length, float scale
 	}
 }
 
-// Forward declaration for optional GPU FWHT (defined later)
-inline Status fwht_inplace_opencl(float *data, std::size_t length);
 // ===== fast_transform (FWHT) =====
+KLLM_INLINE void fwht_inplace_parallel(float * KLLM_RESTRICT data, std::size_t length, ThreadPool &pool);
 KLLM_INLINE void fwht_inplace(float * KLLM_RESTRICT data, std::size_t length) {
 	if (data == nullptr || !is_power_of_two(length)) {
 		return;
 	}
-	// Optional GPU path for large inputs (best-effort)
-	if (global_config().enable_gpu && length >= global_config().parallel_threshold) {
-		Status st = fwht_inplace_opencl(data, length);
-		if (st.ok()) return; // fallback to CPU if not available
+	// Auto-parallelize for large inputs
+	if (length >= global_config().parallel_threshold) {
+		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+		ThreadPool &pool = get_thread_local_pool(threads);
+		fwht_inplace_parallel(data, length, pool);
+		return;
 	}
 	for (std::size_t half_block = 1; half_block < length; half_block <<= 1) {
 		const std::size_t full_block = half_block << 1;
@@ -1843,84 +1844,76 @@ namespace nn {
 	struct Batch{ ValuePtr x; std::vector<int> y; };
 	class DataLoader{ const TensorDataset &ds; DataLoaderConfig cfg; std::vector<size_t> idx; size_t cur=0; public: DataLoader(const TensorDataset&d,DataLoaderConfig c):ds(d),cfg(c){ idx.resize(ds.n); for(size_t i=0;i<ds.n;++i) idx[i]=i; } void reset(){ cur=0; if(cfg.shuffle){ std::mt19937 rng(cfg.seed); std::shuffle(idx.begin(), idx.end(), rng);} } bool next(Batch &out){ if(cur>=idx.size()) return false; size_t b=std::min(cfg.batch, idx.size()-cur); std::vector<float> xb(b*ds.d); std::vector<int> yb(b); for(size_t i=0;i<b;++i){ size_t id=idx[cur+i]; std::memcpy(xb.data()+static_cast<std::ptrdiff_t>(i*ds.d), ds.X.data()+static_cast<std::ptrdiff_t>(id*ds.d), ds.d*sizeof(float)); yb[i]=ds.y[id]; } cur+=b; out.x=tensor(xb,{b,ds.d},false); out.y=std::move(yb); return true; } };
 	class Trainer{ public: struct Config{ size_t epochs; Config():epochs(3){} } cfg; explicit Trainer(Config c=Config()):cfg(c){} struct Metrics{ double loss=0.0,acc=0.0; size_t samples=0; }; Metrics fit(Module &model, DataLoader &loader, Optimizer &opt){ loader.reset(); Metrics m{}; size_t correct=0; Batch batch{}; for(size_t e=0;e<cfg.epochs;++e){ loader.reset(); while(loader.next(batch)){ auto logits=model.forward(batch.x); auto loss=cross_entropy_logits(logits, batch.y); opt.zero_grad(); loss->backward(); opt.step(); m.loss += loss->data[0]*double(batch.y.size()); m.samples += batch.y.size(); size_t B=logits->shape[0], C=logits->shape[1]; for(size_t i=0;i<B;++i){ size_t arg=0; float best=logits->data[i*C+0]; for(size_t c=1;c<C;++c){ float v=logits->data[i*C+c]; if(v>best){ best=v; arg=c; } } if(int(arg)==batch.y[i]) ++correct; } } } m.acc = (m.samples==0)?0.0:double(correct)/double(m.samples); return m; } };
+
+	// Convenience: printable summary
+	inline std::string summary_str(Module&m){ auto ps=collect_parameters(m); size_t total=0; for(auto &p:ps) total+=p->numel(); std::ostringstream oss; oss<<"Parameters: "<<ps.size()<<", scalars: "<<total; return oss.str(); }
+
+	// Error-handling wrappers
+	inline StatusOr<ValuePtr> try_add(const ValuePtr&a,const ValuePtr&b){ if(!a||!b) return make_status(StatusCode::kInvalidArgument, "add: null operand"); if(!same(a->shape,b->shape)) return make_status(StatusCode::kInvalidArgument, "add: shape mismatch"); return add(a,b); }
+	inline StatusOr<ValuePtr> try_mul(const ValuePtr&a,const ValuePtr&b){ if(!a||!b) return make_status(StatusCode::kInvalidArgument, "mul: null operand"); if(!same(a->shape,b->shape)) return make_status(StatusCode::kInvalidArgument, "mul: shape mismatch"); return mul(a,b); }
+	inline StatusOr<ValuePtr> try_matmul(const ValuePtr&A,const ValuePtr&B){ if(!A||!B) return make_status(StatusCode::kInvalidArgument, "matmul: null operand"); if(A->shape.size()!=2||B->shape.size()!=2) return make_status(StatusCode::kInvalidArgument, "matmul: rank must be 2"); if(A->shape[1]!=B->shape[0]) return make_status(StatusCode::kInvalidArgument, "matmul: inner dims mismatch"); auto out=matmul(A,B); if(!out) return make_status(StatusCode::kInternal, "matmul failed"); return out; }
+	inline StatusOr<ValuePtr> try_add_bias(const ValuePtr&x,const ValuePtr&b){ if(!x||!b) return make_status(StatusCode::kInvalidArgument, "add_bias: null operand"); if(x->shape.size()!=2||b->shape.size()!=1||x->shape[1]!=b->shape[0]) return make_status(StatusCode::kInvalidArgument, "add_bias: shape mismatch"); auto out=add_bias(x,b); if(!out) return make_status(StatusCode::kInternal, "add_bias failed"); return out; }
+
+	// Simple training helper
+	struct SimpleFitConfig{ size_t epochs=3; size_t batch=64; float lr=1e-3f; bool use_adam=true; unsigned seed=1234; };
+	struct SimpleFitMetrics{ double avg_loss=0.0; double acc=0.0; size_t samples=0; };
+	inline StatusOr<SimpleFitMetrics> fit_simple(Module &model, const TensorDataset &ds, SimpleFitConfig cfg = {}){
+		DataLoader loader(ds, DataLoaderConfig{cfg.batch, true, cfg.seed});
+		auto params = collect_parameters(model);
+		std::unique_ptr<Optimizer> opt;
+		if(cfg.use_adam) opt.reset(new Adam(params, cfg.lr)); else opt.reset(new SGD(params, cfg.lr));
+		Trainer::Config tcfg; tcfg.epochs = cfg.epochs; Trainer trainer(tcfg);
+		auto m = trainer.fit(model, loader, *opt);
+		SimpleFitMetrics r; r.avg_loss = (m.samples==0?0.0:m.loss/double(m.samples)); r.acc = m.acc; r.samples = m.samples; return r;
+	}
 	inline void summary(Module&m,std::ostream &os=std::cout){ auto ps=collect_parameters(m); size_t total=0; for(auto &p:ps) total+=p->numel(); os<<"Parameters: "<<ps.size()<<", scalars: "<<total<<"\n"; }
 } // namespace nn
 
 // Extended reward functions
 inline float reward_f1_binary(const std::vector<int>&pred,const std::vector<int>&lab){ size_t tp=0,fp=0,fn=0; size_t n=std::min(pred.size(),lab.size()); for(size_t i=0;i<n;++i){ int p=pred[i]?1:0; int y=lab[i]?1:0; if(p==1&&y==1)++tp; else if(p==1&&y==0)++fp; else if(p==0&&y==1)++fn; } float pr=(tp+fp==0)?0.f:float(tp)/float(tp+fp); float rc=(tp+fn==0)?0.f:float(tp)/float(tp+fn); return (pr+rc==0.f)?0.f:(2.f*pr*rc/(pr+rc)); }
-inline float reward_bleu_1_4(const std::vector<int>&pred,const std::vector<int>&ref,size_t max_n=4){ if(pred.empty()||ref.empty()) return 0.f; max_n=std::max<size_t>(1,std::min<size_t>(max_n,4)); auto counts=[&](const std::vector<int>&s,size_t n){ std::unordered_map<std::string,size_t> m; if(s.size()<n) return m; for(size_t i=0;i+n<=s.size();++i){ std::string k; k.reserve(n*4); for(size_t j=0;j<n;++j){ k.append(std::to_string(s[i+j])); k.push_back(','); } ++m[k]; } return m; }; double logp=0.0; for(size_t n=1;n<=max_n;++n){ auto cp=counts(pred,n), cr=counts(ref,n); int match=0, tot=0; for(auto &kv:cp){ int p=kv.second, r=cr[kv.first]; match+=std::min(p,r); tot+=p; } double pn=(tot==0)?0.0:double(match)/double(tot); logp += (pn<=0.0)?-1e9:std::log(pn); } double bp=1.0; if(pred.size()<ref.size()) bp=std::exp(1.0-double(ref.size())/double(pred.size())); return float(bp*std::exp(logp/double(max_n))); }
-inline float reward_rouge_l(const std::vector<int>&pred,const std::vector<int>&ref){ size_t n=pred.size(), m=ref.size(); if(n==0||m==0) return 0.f; std::vector<size_t> dp(m+1,0); for(size_t i=1;i<=n;++i){ size_t prev=0; for(size_t j=1;j<=m;++j){ size_t tmp=dp[j]; if(pred[i-1]==ref[j-1]) dp[j]=prev+1; else dp[j]=std::max(dp[j], dp[j-1]); prev=tmp; } } float lcs=float(dp[m]); float pr=lcs/float(n), rc=lcs/float(m); return (pr+rc==0.f)?0.f:(2.f*pr*rc/(pr+rc)); }
+inline float reward_bleu_1_4(const std::vector<int>&pred,const std::vector<int>&ref,size_t max_n=4){
+    if(pred.empty()||ref.empty()) return 0.f;
+    max_n=std::max<size_t>(1,std::min<size_t>(max_n,4));
+    auto counts=[&](const std::vector<int>&s,size_t n){
+        std::unordered_map<std::string,size_t> m;
+        if(s.size()<n) return m;
+        for(size_t i=0;i+n<=s.size();++i){
+            std::string k; k.reserve(n*4);
+            for(size_t j=0;j<n;++j){ k.append(std::to_string(s[i+j])); k.push_back(','); }
+            ++m[k];
+        }
+        return m;
+    };
+    double logp=0.0;
+    for(size_t n=1;n<=max_n;++n){
+        auto cp=counts(pred,n), cr=counts(ref,n);
+        int match=0, tot=0;
+        for(auto &kv:cp){ int p=static_cast<int>(kv.second); int r=static_cast<int>(cr[kv.first]); match+=std::min(p,r); tot+=p; }
+        double pn=(tot==0)?0.0:double(match)/double(tot);
+        logp += (pn<=0.0)?-1e9:std::log(pn);
+    }
+    double bp=1.0;
+    if(pred.size()<ref.size()) bp=std::exp(1.0-double(ref.size())/double(pred.size()));
+    return float(bp*std::exp(logp/double(max_n)));
+}
+
+inline float reward_rouge_l(const std::vector<int>&pred,const std::vector<int>&ref){
+    size_t n=pred.size(), m=ref.size(); if(n==0||m==0) return 0.f;
+    std::vector<size_t> dp(m+1,0);
+    for(size_t i=1;i<=n;++i){ size_t prev=0; for(size_t j=1;j<=m;++j){ size_t tmp=dp[j]; if(pred[i-1]==ref[j-1]) dp[j]=prev+1; else dp[j]=std::max(dp[j], dp[j-1]); prev=tmp; } }
+    float lcs=float(dp[m]); float pr=lcs/float(n), rc=lcs/float(m); return (pr+rc==0.f)?0.f:(2.f*pr*rc/(pr+rc));
+}
 
 // ===== onnx (stub) =====
 inline Status import_onnx_model(const std::string &path) {
-	(void)path;
-	if (global_config().deterministic) {
-		// In deterministic mode, skip random initializations, etc. Stub ok.
-		return Status::OK();
-	}
-	return Status::OK();
+    (void)path;
+    if (global_config().deterministic) {
+        // In deterministic mode, skip random initializations, etc. Stub ok.
+        return Status::OK();
+    }
+    return Status::OK();
 }
 
-// ===== Optional GPU FWHT (stub; requires compile-time enable) =====
-#if defined(KLLM_USE_OPENCL)
-#include <CL/cl.h>
-namespace detail {
-	static const char *kFwhtKernel = R"CLC(
-	__kernel void fwht_stage(__global float* data, const int n, const int half_block) {
-		int gid = get_global_id(0);
-		int full_block = half_block << 1;
-		int block = gid / half_block;
-		int i = gid % half_block;
-		int a_idx = block * full_block + i;
-		int b_idx = a_idx + half_block;
-		if (b_idx < n) {
-			float a = data[a_idx];
-			float b = data[b_idx];
-			data[a_idx] = a + b;
-			data[b_idx] = a - b;
-		}
-	}
-	)CLC";
-}
-inline Status fwht_inplace_opencl(float *data, std::size_t length) {
-	if (!data || !is_power_of_two(length)) return make_status(StatusCode::kInvalidArgument, "OpenCL FWHT: invalid input");
-	cl_int err = 0;
-	cl_uint num_platforms = 0; err = clGetPlatformIDs(0, nullptr, &num_platforms); if (err != CL_SUCCESS || num_platforms == 0) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: no platform");
-	std::vector<cl_platform_id> plats(num_platforms); err = clGetPlatformIDs(num_platforms, plats.data(), nullptr); if (err != CL_SUCCESS) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clGetPlatformIDs failed");
-	cl_platform_id platform = plats[0];
-	cl_uint num_devices = 0; err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices); if (err != CL_SUCCESS || num_devices == 0) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: no GPU device");
-	std::vector<cl_device_id> devs(num_devices); err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devs.data(), nullptr); if (err != CL_SUCCESS) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clGetDeviceIDs failed");
-	cl_device_id dev = devs[0];
-	cl_context ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err); if (!ctx || err != CL_SUCCESS) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateContext failed");
-	cl_command_queue q = clCreateCommandQueue(ctx, dev, 0, &err); if (!q || err != CL_SUCCESS) { clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateCommandQueue failed"); }
-	const char *src = detail::kFwhtKernel; size_t srclen = std::strlen(src);
-	cl_program prog = clCreateProgramWithSource(ctx, 1, &src, &srclen, &err); if (!prog || err != CL_SUCCESS) { clReleaseCommandQueue(q); clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateProgramWithSource failed"); }
-	err = clBuildProgram(prog, 1, &dev, "", nullptr, nullptr);
-	if (err != CL_SUCCESS) { clReleaseProgram(prog); clReleaseCommandQueue(q); clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clBuildProgram failed"); }
-	cl_kernel kernel = clCreateKernel(prog, "fwht_stage", &err); if (!kernel || err != CL_SUCCESS) { clReleaseProgram(prog); clReleaseCommandQueue(q); clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateKernel failed"); }
-	cl_mem buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, length * sizeof(float), data, &err); if (!buf || err != CL_SUCCESS) { clReleaseKernel(kernel); clReleaseProgram(prog); clReleaseCommandQueue(q); clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateBuffer failed"); }
-	for (std::size_t half_block = 1; half_block < length; half_block <<= 1) {
-		int n_int = static_cast<int>(length);
-		int hb_int = static_cast<int>(half_block);
-		err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &buf); if (err != CL_SUCCESS) break;
-		err = clSetKernelArg(kernel, 1, sizeof(int), &n_int); if (err != CL_SUCCESS) break;
-		err = clSetKernelArg(kernel, 2, sizeof(int), &hb_int); if (err != CL_SUCCESS) break;
-		size_t global = (length / (half_block << 1)) * half_block; if (global == 0) global = half_block;
-		err = clEnqueueNDRangeKernel(q, kernel, 1, nullptr, &global, nullptr, 0, nullptr, nullptr); if (err != CL_SUCCESS) break;
-	}
-	err = clEnqueueReadBuffer(q, buf, CL_TRUE, 0, length * sizeof(float), data, 0, nullptr, nullptr);
-	clReleaseMemObject(buf);
-	clReleaseKernel(kernel);
-	clReleaseProgram(prog);
-	clReleaseCommandQueue(q);
-	clReleaseContext(ctx);
-	if (err != CL_SUCCESS) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: kernel enqueue/read failed");
-	return Status::OK();
-}
-#else
-inline Status fwht_inplace_opencl(float *data, std::size_t length) {
-	(void)data; (void)length; return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT disabled. Compile with -DKLLM_USE_OPENCL.");
-}
-#endif
+// GPU FWHT removed; CPU-only build
 
 } // namespace kllm

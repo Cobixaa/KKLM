@@ -1,10 +1,10 @@
-## KLLM — CPU-first, Mobile-ready DL Primitives with Optional GPU (Header-only)
+## KLLM — CPU-first, Mobile-ready DL Primitives (Header-only, CPU-only)
 
 KLLM (Key-Light Large Model) is a C++17 header-only runtime of high-performance transform and sketch primitives with fused microkernels, a tiny IR + planner, streaming pipeline, and quantization to int8/int4.
 
 - Header-only, zero external deps by default; builds on Linux and Android/Termux
 - AVX2/NEON-optimized FWHT, scalar fallback
-- Optional OpenCL GPU FWHT (best-effort): x86/ARM GPUs when available
+- GPU support removed: streamlined CPU-only path for maximum portability
 - Streaming pipeline v2.1: Transform → Sketch → Route → Quantize with slab buffering
 - Parallel sketch, routing, and blockwise quantization
 - Tiny IR + planner that fuses Transform+Relu
@@ -13,18 +13,17 @@ KLLM (Key-Light Large Model) is a C++17 header-only runtime of high-performance 
 
 ---
 
-### What’s new (v2.2)
+### What’s new (v2.2 CPU)
 - Parallel SketchEngine and RoutingEngine (across buckets)
 - Parallel blockwise quantization (int8/int4)
 - Pipeline buffer reuse to reduce allocations
-- Optional OpenCL FWHT path with `set_enable_gpu(true)` and `-DKLLM_USE_OPENCL`
-- Bench harness prints per-stage timings and supports `KLLM_GPU=1`
+- GPU code paths removed; simpler build and predictable performance on CPU
 
 Performance snapshot (this environment):
 - Pipeline v2.1 int8 1M: 26–30 ms (down from ~55 ms) depending on run
 - FWHT 1M: ~8.2 ms CPU; fused FWHT-scale-add 1M: ~5.6 ms
 
-Your mileage varies by CPU/GPU.
+Your mileage varies by CPU.
 
 ---
 
@@ -62,18 +61,8 @@ Run:
 
 ---
 
-### Optional GPU (OpenCL)
-- Compile with `-DKLLM_USE_OPENCL` and link OpenCL (`-lOpenCL` on most distros)
-- Enable at runtime: `kllm::set_enable_gpu(true)` or `KLLM_GPU=1` for bench
-- Falls back to CPU if OpenCL platform/device is not found
-
-Example build:
-```bash
-clang++ -std=c++17 -O3 -march=native -fPIC -Wall -Wextra -Wpedantic -Werror -I. \
-  -DKLLM_USE_OPENCL examples/main.cpp -lOpenCL -o kllm_demo
-```
-
-Termux note: OpenCL availability varies by device/ROM. CPU path remains fully supported.
+### GPU
+Removed. CPU-only.
 
 ---
 
@@ -119,12 +108,11 @@ float bleu = kllm::reward_bleu_1_4(seq_pred, seq_ref);
 float rouge = kllm::reward_rouge_l(seq_pred, seq_ref);
 ```
 
-Threading/config:
+Threading/config (CPU):
 ```cpp
 kllm::set_num_threads(8);
 kllm::set_parallel_threshold(1<<14);
 kllm::set_large_slab_bytes(1024*1024);
-kllm::set_enable_gpu(true); // if built with -DKLLM_USE_OPENCL
 ```
 
 ---
@@ -173,12 +161,18 @@ This API is intentionally compact for easy use on mobile/Termux while staying he
 
 ---
 
-### Benchmarks (sample)
+### Benchmarks (this build)
 ```text
-FWHT 1M floats: ~8.2 ms
-FWHT(par,4) 1M floats: ~3.9–4.5 ms
-Fused FWHT-scale-add 1M: ~5.6 ms
-Pipeline v2.1 int8 1M: 26–30 ms, slabs=4 (stage1 dominates)
+FWHT 1M floats: ~8.38 ms
+FWHT(par,4) 1M floats: ~3.12 ms
+Fused FWHT-scale-add 1M: ~6.95 ms
+NTT 262k uint32: ~4.19 ms
+CountSketch 1M -> 262k: ~4.06 ms
+BlockDiag float 1024x(16x16): ~0.050 ms
+BlockDiag int8 1024x(16x16): ~0.047 ms
+LowRank 4096x4096 (r=64): ~0.000038 ms
+Pipeline v2.1 int8 1M: ~29.00 ms, slabs=4
+Pipeline v2.1 int4 1M: ~26.02 ms, slabs=4
 ```
 
 Tips:

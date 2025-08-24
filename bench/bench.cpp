@@ -191,8 +191,7 @@ int main() {
 
 	// v2.1 pipeline bench (int8)
 	{
-		const char *gpu_env = std::getenv("KLLM_GPU");
-		if (gpu_env && std::string(gpu_env) == "1") { kllm::set_enable_gpu(true); }
+		// GPU path removed; CPU-only benchmarks
 		// Tune pipeline for LargeN
 		kllm::set_large_slab_bytes(1024 * 1024); // 1 MB slabs
 		kllm::set_max_inflight_slabs(3);
