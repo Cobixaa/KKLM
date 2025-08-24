@@ -1863,4 +1863,49 @@ namespace nn {
 
 // Extended reward functions
 inline float reward_f1_binary(const std::vector<int>&pred,const std::vector<int>&lab){ size_t tp=0,fp=0,fn=0; size_t n=std::min(pred.size(),lab.size()); for(size_t i=0;i<n;++i){ int p=pred[i]?1:0; int y=lab[i]?1:0; if(p==1&&y==1)++tp; else if(p==1&&y==0)++fp; else if(p==0&&y==1)++fn; } float pr=(tp+fp==0)?0.f:float(tp)/float(tp+fp); float rc=(tp+fn==0)?0.f:float(tp)/float(tp+fn); return (pr+rc==0.f)?0.f:(2.f*pr*rc/(pr+rc)); }
-inline float reward_bleu_1_4(const std::vector<int>&pred,const std::vector<int>&ref,size_t max_n=4){ if(pred.empty()||ref.empty()) return 0.f; max_n=std::max<size_t>(1,std::min<size_t>(max_n,
+inline float reward_bleu_1_4(const std::vector<int>&pred,const std::vector<int>&ref,size_t max_n=4){
+    if(pred.empty()||ref.empty()) return 0.f;
+    max_n=std::max<size_t>(1,std::min<size_t>(max_n,4));
+    auto counts=[&](const std::vector<int>&s,size_t n){
+        std::unordered_map<std::string,size_t> m;
+        if(s.size()<n) return m;
+        for(size_t i=0;i+n<=s.size();++i){
+            std::string k; k.reserve(n*4);
+            for(size_t j=0;j<n;++j){ k.append(std::to_string(s[i+j])); k.push_back(','); }
+            ++m[k];
+        }
+        return m;
+    };
+    double logp=0.0;
+    for(size_t n=1;n<=max_n;++n){
+        auto cp=counts(pred,n), cr=counts(ref,n);
+        int match=0, tot=0;
+        for(auto &kv:cp){ int p=static_cast<int>(kv.second); int r=static_cast<int>(cr[kv.first]); match+=std::min(p,r); tot+=p; }
+        double pn=(tot==0)?0.0:double(match)/double(tot);
+        logp += (pn<=0.0)?-1e9:std::log(pn);
+    }
+    double bp=1.0;
+    if(pred.size()<ref.size()) bp=std::exp(1.0-double(ref.size())/double(pred.size()));
+    return float(bp*std::exp(logp/double(max_n)));
+}
+
+inline float reward_rouge_l(const std::vector<int>&pred,const std::vector<int>&ref){
+    size_t n=pred.size(), m=ref.size(); if(n==0||m==0) return 0.f;
+    std::vector<size_t> dp(m+1,0);
+    for(size_t i=1;i<=n;++i){ size_t prev=0; for(size_t j=1;j<=m;++j){ size_t tmp=dp[j]; if(pred[i-1]==ref[j-1]) dp[j]=prev+1; else dp[j]=std::max(dp[j], dp[j-1]); prev=tmp; } }
+    float lcs=float(dp[m]); float pr=lcs/float(n), rc=lcs/float(m); return (pr+rc==0.f)?0.f:(2.f*pr*rc/(pr+rc));
+}
+
+// ===== onnx (stub) =====
+inline Status import_onnx_model(const std::string &path) {
+    (void)path;
+    if (global_config().deterministic) {
+        // In deterministic mode, skip random initializations, etc. Stub ok.
+        return Status::OK();
+    }
+    return Status::OK();
+}
+
+// GPU FWHT removed; CPU-only build
+
+} // namespace kllm
