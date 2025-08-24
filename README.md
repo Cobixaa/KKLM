@@ -83,34 +83,93 @@ Include the header:
 #include "kklm.h"
 ```
 
-FWHT (in-place), input length must be power-of-two:
+Core transforms:
 ```cpp
+// FWHT in-place; length must be power-of-two
 kllm::fwht_inplace(ptr, n);
 kllm::fwht_inplace_parallel(ptr, n, pool);
 kllm::fwht_inplace_inverse(ptr, n);
+
+// Fused microkernels
+kllm::fused_fwht_scale_add(x, n, scale, y);
+kllm::fused_fwht_bias_relu(x, bias, n, out);
 ```
 
-v2.1 pipeline helpers:
+Pipelines and quant:
 ```cpp
-kllm::PipelineTelemetry t{};
+kllm::PipelineTelemetry T{};
 std::vector<int8_t> q8; std::vector<float> scales;
-auto st = kllm::run_pipeline_v21_to_int8(input, sketch_size, q8, scales, t, kllm::PointwiseOp::kRelu);
+// Transform -> Sketch -> Pointwise -> Route -> Quantize
+kllm::run_pipeline_v21_to_int8(input, sketch_size, q8, scales, T, kllm::PointwiseOp::kRelu);
 ```
 
-Quantization:
+Sketch and routing:
 ```cpp
-kllm::BlockwiseQuantConfig qcfg; qcfg.block_size = 64;
-std::vector<int8_t> q; std::vector<float> sc;
-kllm::blockwise_quantize_int8(x.data(), x.size(), qcfg, q, sc);
+kllm::CountSketch cs(1<<12, 3);
+cs.apply(x.data(), x.size(), y.data());
 ```
 
-Threading/Config:
+Rewards/metrics:
+```cpp
+float mse = kllm::reward_mse(pred, target);
+float cos = kllm::reward_cosine_similarity(a, b);
+float acc = kllm::reward_top1_accuracy(logits, labels, num_classes);
+float f1  = kllm::reward_f1_binary(pred_labels, true_labels);
+float bleu = kllm::reward_bleu_1_4(seq_pred, seq_ref);
+float rouge = kllm::reward_rouge_l(seq_pred, seq_ref);
+```
+
+Threading/config:
 ```cpp
 kllm::set_num_threads(8);
 kllm::set_parallel_threshold(1<<14);
 kllm::set_large_slab_bytes(1024*1024);
-kllm::set_enable_gpu(true); // requires OpenCL build
+kllm::set_enable_gpu(true); // if built with -DKLLM_USE_OPENCL
 ```
+
+---
+
+### nn/autograd quickstart
+Build a tiny MLP classifier using the new minimal nn API:
+```cpp
+using namespace kllm::nn;
+
+// Data: N samples of D features with integer labels in [0,C)
+std::vector<std::vector<float>> X; std::vector<int> Y; /* fill */
+auto ds = TensorDataset::from(X, Y);
+DataLoader loader(ds, DataLoaderConfig{.batch=64, .shuffle=true});
+
+// Model: D -> 64 -> C
+size_t D = ds.d, C = 10;
+auto net = Sequential({
+  std::make_shared<Linear>(D, 64),
+  // GELU via manual call
+});
+
+// Attach second layer
+net.mods.push_back(std::make_shared<Linear>(64, C));
+
+// Collect params and choose optimizer
+auto params = collect_parameters(net);
+Adam opt(params, 1e-3f);
+
+// Train
+Trainer::Config cfg; cfg.epochs = 5;
+Trainer trainer(cfg);
+auto metrics = trainer.fit(net, loader, opt);
+std::cout << "Loss=" << metrics.loss / metrics.samples
+          << ", Acc=" << metrics.acc << "\n";
+```
+
+Available ops and layers:
+- Tensors: `tensor(values, shape, requires_grad)`, `zeros(shape)`, `randn(shape)`
+- Ops: `add`, `mul`, `matmul`, `add_bias`, `relu`, `gelu`, `softmax_lastdim`, losses: `mse_loss`, `cross_entropy_logits`
+- Modules: `Linear`, `Sequential`; utilities: `collect_parameters`, `summary`
+- Optimizers: `SGD(params, lr[, weight_decay])`, `Adam(params, lr)`
+- Data: `TensorDataset::from`, `DataLoader` with batch/shuffle
+- Trainer: `Trainer(cfg).fit(model, loader, optimizer)`
+
+This API is intentionally compact for easy use on mobile/Termux while staying header-only.
 
 ---
 
