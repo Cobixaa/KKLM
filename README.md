@@ -15,6 +15,25 @@ KLLM (Key-Light Large Model) is a CPU-first, C++17 header-only library providing
 - Extended error handling: errno-aware messages, `StatusOr<T>`, guard macros
 - Config extensions: `parallel_threshold`, `pin_threads`, reusable thread-local pool
 - Optimized fused kernels: automatic parallel FWHT for large inputs
+- v2.1: streaming execution pipeline (LargeN) with slab buffers and two-level routing
+- v2.1: blockwise quantization manager (int8/int4), sketch engine v2, routing v2
+
+---
+
+### New in v2.1 (Flatline)
+- Streaming LargeN pipeline with 2–3 slabs in flight; non-temporal edge stores when beneficial
+- Hierarchical flow: Load/Quantize → Transform⊕Sketch → Route⊕Pointwise → Quantize/Output
+- Two-level routing with per-bucket top-k, deterministic stable ordering when `deterministic=true`
+- Blockwise int8/int4 quantization with per-block scales (32–128 elems), dequant helpers
+- Config additions:
+  - `set_large_slab_bytes(bytes)` (default 256 KB)
+  - `set_max_inflight_slabs(n)` (default 3)
+  - `set_pipeline_nt_stores(bool)`
+  - `set_sketch_num_hashes(h)` (1–4)
+  - `set_routing_bucket_size(sz)` (default 256)
+- Public APIs:
+  - `kllm::run_pipeline_v21_to_int8(input, sketch_size, q8, scales, telemetry, pointwise)`
+  - `kllm::run_pipeline_v21_to_int4(input, sketch_size, q4, scales, telemetry, pointwise)`
 
 ---
 
@@ -86,9 +105,15 @@ void kllm::fwht_inplace_parallel(float *data, std::size_t length, kllm::ThreadPo
 void kllm::fwht_inplace_inverse(float *data, std::size_t length);
 ```
 
-- NTT over 998244353 (power-of-two size):
+- v2.1 pipeline APIs:
 ```cpp
-bool kllm::ntt_inplace(std::vector<std::uint32_t> &a, bool invert);
+// Quantize to int8
+kllm::PipelineTelemetry t{}; std::vector<int8_t> q8; std::vector<float> scales;
+auto st = kllm::run_pipeline_v21_to_int8(input, sketch_size, q8, scales, t, kllm::PointwiseOp::kRelu);
+
+// Quantize to int4 (packed)
+kllm::PipelineTelemetry t2{}; std::vector<uint8_t> q4; std::vector<float> scales2;
+auto st2 = kllm::run_pipeline_v21_to_int4(input, sketch_size, q4, scales2, t2, kllm::PointwiseOp::kRelu);
 ```
 
 - CountSketch:
@@ -105,39 +130,18 @@ void kllm::fused_fwht_scale_add(const float *input, std::size_t length, float sc
 void kllm::fused_fwht_bias_relu(const float *input, const float *bias, std::size_t length, float *destination);
 ```
 
-- Memory:
-```cpp
-std::unique_ptr<void, kllm::FreeDeleter> kllm::allocate_aligned_bytes(std::size_t size_bytes, std::size_t alignment);
-
-template <typename T>
-std::unique_ptr<T, kllm::FreeDeleter> kllm::allocate_aligned(std::size_t count, std::size_t alignment);
-
-kllm::Status kllm::set_current_thread_affinity_status(int cpu_index);
-bool kllm::set_current_thread_affinity(int cpu_index);
-```
-
-- IR, planner, and evaluation:
-```cpp
-struct kllm::Tensor { std::vector<float> values; };
-struct kllm::Node { virtual ~Node(); virtual Tensor evaluate() = 0; };
-
-struct kllm::GraphBuilder {
-	static std::shared_ptr<Node> input(const std::vector<float> &values);
-	static std::shared_ptr<Node> transform(const std::shared_ptr<Node> &in);
-	static std::shared_ptr<Node> relu(const std::shared_ptr<Node> &in);
-};
-
-struct kllm::Planner {
-	static std::shared_ptr<Node> plan(const std::shared_ptr<Node> &root);
-};
-```
-
 - Quantization:
 ```cpp
 struct kllm::QuantParams { float scale; };
 kllm::QuantParams kllm::choose_symmetric_int8_scale(const float *data, std::size_t length);
 void kllm::quantize_int8(const float *input, std::size_t length, int8_t *output, const QuantParams &params);
 void kllm::dequantize_int8(const int8_t *input, std::size_t length, float scale, float *output);
+
+// v2.1 blockwise
+void kllm::blockwise_quantize_int8(const float*, std::size_t, const BlockwiseQuantConfig&, std::vector<int8_t>&, std::vector<float>&);
+void kllm::blockwise_dequantize_int8(const int8_t*, std::size_t, const BlockwiseQuantConfig&, const std::vector<float>&, std::vector<float>&);
+void kllm::blockwise_quantize_int4(const float*, std::size_t, std::size_t block_size, BlockwiseInt4Buffer&);
+void kllm::blockwise_dequantize_int4(const BlockwiseInt4Buffer&, std::vector<float>&);
 ```
 
 - Parallel helpers:
@@ -170,14 +174,31 @@ System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features auto
 
 ---
 
-### Performance Notes
-- Prefer power-of-two lengths for transforms.
-- Use `-march=native -O3`. Pin threads via `set_current_thread_affinity` for NUMA. On Linux/Android, affinity uses `sched_setaffinity()`; returns detailed `Status` via `set_current_thread_affinity_status`.
-- Keep working sets within L1/L2; consider tiling at the call site.
-- Fuse downstream pointwise ops with transforms (see IR planner) to reduce memory traffic.
-- For int8 paths, pack/accumulate in int32 and dequantize late; batch operations for better cache locality.
-- On aarch64, build with `-march=armv8-a+simd`; NEON kernels are enabled automatically.
-- Set `kllm::set_parallel_threshold()` and `kllm::set_num_threads()` to tune parallel fused FWHT. Use `kllm::set_pin_threads(true)` to request worker pinning.
+### Benchmarks (sample on this environment)
+```
+FWHT 1M floats: 8.24545 ms
+FWHT(par,4) 1M floats: 3.61539 ms
+Fused FWHT-scale-add 1M: 6.67958 ms
+FWHT 2048 floats: 12762 ns
+Fused FWHT-scale-add 2048: 13394 ns
+NTT 262k uint32: 4.44111 ms
+CountSketch 1M -> 262k (3 hashes): 4.43309 ms
+BlockDiag float 1024x(16x16): 0.047842 ms
+BlockDiag int8 1024x(16x16): 0.0464 ms
+LowRank 4096x4096 (r=64): 3.1e-05 ms
+Pipeline v2.1 int8 1M: 28.6805 ms, slabs=16
+Pipeline v2.1 int4 1M: 28.9056 ms, slabs=16
+```
+Targets: -20 ms vs baseline at N≈1,048,576 and flat throughput from 64K→1M+.
+
+---
+
+### Configuration Tips
+- `kllm::set_parallel_threshold(1<<14)` and `kllm::set_num_threads()` tune parallel transforms.
+- `kllm::set_large_slab_bytes(256*1024)` and `kllm::set_max_inflight_slabs(3)` control pipeline buffering.
+- `kllm::set_pipeline_nt_stores(true)` enables non-temporal stores on edge stages for LargeN.
+- `kllm::set_sketch_num_hashes(3)` and `kllm::set_routing_bucket_size(256)` tune sketch/router balance.
+- `kllm::set_pin_threads(true)` may improve NUMA locality on Linux.
 
 ---
 

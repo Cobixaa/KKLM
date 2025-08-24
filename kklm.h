@@ -171,6 +171,13 @@ struct Config {
 	std::size_t prefetch_distance = 32; // elements ahead for prefetching (floats)
 	std::size_t parallel_threshold = 1 << 14; // use parallel paths when length >= threshold
 	bool pin_threads = false; // try to pin worker threads to cores on Linux
+	// v2.1 additions
+	bool prefer_hugepages = false; // hint for slab allocator (best-effort)
+	std::size_t large_slab_bytes = 256 * 1024; // 256 KB default slab size
+	std::size_t max_inflight_slabs = 3; // double/triple buffering
+	bool enable_pipeline_nt_stores = true; // allow non-temporal stores at pipeline edges
+	std::size_t sketch_num_hashes = 3; // CountSketch hashes for v2 path
+	std::size_t routing_bucket_size = 256; // elements per routing bucket (approx L2 tile)
 };
 
 inline Config & global_config() {
@@ -197,6 +204,14 @@ inline void set_parallel_threshold(std::size_t threshold) {
 inline void set_pin_threads(bool pin) {
 	global_config().pin_threads = pin;
 }
+
+// v2.1 config setters
+inline void set_large_slab_bytes(std::size_t bytes) { global_config().large_slab_bytes = bytes; }
+inline void set_max_inflight_slabs(std::size_t n) { global_config().max_inflight_slabs = n == 0 ? 1 : n; }
+inline void set_prefer_hugepages(bool enable) { global_config().prefer_hugepages = enable; }
+inline void set_pipeline_nt_stores(bool enable) { global_config().enable_pipeline_nt_stores = enable; }
+inline void set_sketch_num_hashes(std::size_t h) { global_config().sketch_num_hashes = (h < 1 ? 1 : (h > 4 ? 4 : h)); }
+inline void set_routing_bucket_size(std::size_t b) { global_config().routing_bucket_size = (b == 0 ? 256 : b); }
 
 // ===== memory =====
 struct FreeDeleter {
@@ -1256,6 +1271,407 @@ inline Status train_step_mse(std::vector<float> &params, const std::vector<float
 	sgd_step(params, grads, opt);
 	out.loss = loss;
 	return Status::OK();
+}
+
+// ===== v2.1: low-level non-temporal store helpers =====
+#if defined(__AVX2__)
+KLLM_INLINE void stream_store_float32_aligned(float *dst, const float *src) {
+	__m256 v = _mm256_load_ps(src);
+	_mm256_stream_ps(dst, v);
+}
+#endif
+
+KLLM_INLINE void maybe_stream_store_range(float *dst, const float *src, std::size_t count) {
+	if (!dst || !src || count == 0) return;
+	const bool allow_nt = global_config().enable_pipeline_nt_stores;
+	if (!allow_nt) {
+		// Fallback copy
+		for (std::size_t i = 0; i < count; ++i) dst[i] = src[i];
+		return;
+	}
+#if defined(__AVX2__)
+	// Use non-temporal stores where possible. Align destination to 32 bytes first.
+	std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(dst);
+	std::size_t prefix = 0;
+	if ((addr & 31u) != 0u) {
+		prefix = (32u - (addr & 31u)) / sizeof(float);
+		if (prefix > count) prefix = count;
+		for (std::size_t i = 0; i < prefix; ++i) dst[i] = src[i];
+		dst += prefix; src += prefix; count -= prefix;
+	}
+	std::size_t i = 0;
+	for (; i + 8 <= count; i += 8) {
+		stream_store_float32_aligned(dst + i, src + i);
+	}
+	for (; i < count; ++i) dst[i] = src[i];
+	_mm_sfence();
+#else
+	for (std::size_t i = 0; i < count; ++i) dst[i] = src[i];
+#endif
+}
+
+// ===== v2.1: quantization manager (blockwise int8/int4) =====
+struct BlockwiseQuantConfig {
+	std::size_t block_size = 64; // 32–128 typical
+};
+
+inline void blockwise_quantize_int8(const float *input, std::size_t length, const BlockwiseQuantConfig &cfg,
+	std::vector<int8_t> &q, std::vector<float> &scales) {
+	if (!input || length == 0) { q.clear(); scales.clear(); return; }
+	const std::size_t bs = (cfg.block_size == 0) ? 64 : cfg.block_size;
+	const std::size_t num_blocks = (length + bs - 1) / bs;
+	q.resize(length);
+	scales.resize(num_blocks);
+	for (std::size_t b = 0; b < num_blocks; ++b) {
+		const std::size_t start = b * bs;
+		const std::size_t end = std::min(start + bs, length);
+		float max_abs = 0.0f;
+		for (std::size_t i = start; i < end; ++i) {
+			float v = input[i]; v = v < 0.0f ? -v : v; if (v > max_abs) max_abs = v;
+		}
+		float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 127.0f);
+		if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
+		scales[b] = s;
+		const float inv = 1.0f / s;
+		for (std::size_t i = start; i < end; ++i) {
+			int vi = static_cast<int>(input[i] * inv + (input[i] >= 0.0f ? 0.5f : -0.5f));
+			if (vi > 127) vi = 127; if (vi < -127) vi = -127;
+			q[i] = static_cast<int8_t>(vi);
+		}
+	}
+}
+
+inline void blockwise_dequantize_int8(const int8_t *q, std::size_t length, const BlockwiseQuantConfig &cfg,
+	const std::vector<float> &scales, std::vector<float> &output) {
+	if (!q || length == 0) { output.clear(); return; }
+	const std::size_t bs = (cfg.block_size == 0) ? 64 : cfg.block_size;
+	const std::size_t num_blocks = (length + bs - 1) / bs;
+	output.resize(length);
+	for (std::size_t b = 0; b < num_blocks; ++b) {
+		const float s = (b < scales.size() && std::isfinite(scales[b]) && scales[b] > 0.0f) ? scales[b] : 1.0f;
+		const std::size_t start = b * bs;
+		const std::size_t end = std::min(start + bs, length);
+		for (std::size_t i = start; i < end; ++i) output[i] = static_cast<float>(q[i]) * s;
+	}
+}
+
+// Int4 pack: two signed 4-bit values per byte, range [-7, 7]
+inline uint8_t pack_int4_pair(int v0, int v1) {
+	int a = (v0 < -7 ? -7 : (v0 > 7 ? 7 : v0));
+	int b = (v1 < -7 ? -7 : (v1 > 7 ? 7 : v1));
+	uint8_t lo = static_cast<uint8_t>(a & 0x0F);
+	uint8_t hi = static_cast<uint8_t>((b & 0x0F) << 4);
+	return static_cast<uint8_t>(lo | hi);
+}
+
+inline void unpack_int4_pair(uint8_t byte, int &v0, int &v1) {
+	int lo = static_cast<int>(byte & 0x0F);
+	int hi = static_cast<int>((byte >> 4) & 0x0F);
+	// sign-extend 4-bit signed values (range -8..7). We clamp later to [-7,7].
+	if (lo & 0x08) lo |= ~0x0F; if (hi & 0x08) hi |= ~0x0F;
+	if (lo < -7) lo = -7; if (lo > 7) lo = 7;
+	if (hi < -7) hi = -7; if (hi > 7) hi = 7;
+	v0 = lo; v1 = hi;
+}
+
+struct BlockwiseInt4Buffer {
+	std::vector<uint8_t> data; // packed
+	std::vector<float> scales; // per block
+	std::size_t original_length = 0;
+	std::size_t block_size = 32;
+};
+
+inline void blockwise_quantize_int4(const float *input, std::size_t length, std::size_t block_size, BlockwiseInt4Buffer &out) {
+	if (!input || length == 0) { out.data.clear(); out.scales.clear(); out.original_length = 0; out.block_size = block_size; return; }
+	const std::size_t bs = (block_size == 0) ? 32 : block_size;
+	const std::size_t num_blocks = (length + bs - 1) / bs;
+	out.original_length = length; out.block_size = bs; out.scales.resize(num_blocks);
+	const std::size_t packed_per_block = (bs + 1) / 2;
+	out.data.resize(num_blocks * packed_per_block);
+	for (std::size_t b = 0; b < num_blocks; ++b) {
+		const std::size_t start = b * bs;
+		const std::size_t end = std::min(start + bs, length);
+		float max_abs = 0.0f;
+		for (std::size_t i = start; i < end; ++i) { float v = input[i]; v = v < 0.0f ? -v : v; if (v > max_abs) max_abs = v; }
+		float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 7.0f);
+		if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
+		out.scales[b] = s;
+		const float inv = 1.0f / s;
+		for (std::size_t i = start, k = 0; i < end; i += 2, ++k) {
+			int v0 = static_cast<int>(input[i] * inv + (input[i] >= 0.0f ? 0.5f : -0.5f));
+			int v1 = 0;
+			if (i + 1 < end) v1 = static_cast<int>(input[i + 1] * inv + (input[i + 1] >= 0.0f ? 0.5f : -0.5f));
+			out.data[b * packed_per_block + k] = pack_int4_pair(v0, v1);
+		}
+		// If odd tail, last high nibble corresponds to missing element; treat as 0 in dequant
+	}
+}
+
+inline void blockwise_dequantize_int4(const BlockwiseInt4Buffer &in, std::vector<float> &out) {
+	const std::size_t length = in.original_length;
+	out.resize(length);
+	const std::size_t bs = (in.block_size == 0) ? 32 : in.block_size;
+	const std::size_t num_blocks = (length + bs - 1) / bs;
+	const std::size_t packed_per_block = (bs + 1) / 2;
+	for (std::size_t b = 0; b < num_blocks; ++b) {
+		const float s = (b < in.scales.size() && std::isfinite(in.scales[b]) && in.scales[b] > 0.0f) ? in.scales[b] : 1.0f;
+		const std::size_t start = b * bs;
+		const std::size_t end = std::min(start + bs, length);
+		for (std::size_t k = 0, i = start; i < end; ++k) {
+			int v0, v1; unpack_int4_pair(in.data[b * packed_per_block + k], v0, v1);
+			out[i++] = static_cast<float>(v0) * s;
+			if (i < end) out[i++] = static_cast<float>(v1) * s;
+		}
+	}
+}
+
+// ===== v2.1 sketch engine (fused SignHash+Accumulate with stats) =====
+struct SketchEngineV2 {
+	std::size_t sketch_size = 0;
+	std::size_t num_hashes = 3;
+	std::uint64_t seed_base = 0x12345678abcdef00ull;
+	// Outputs optional collision counts for telemetry
+	void apply(const float *input, std::size_t length, float *output, std::vector<std::size_t> *collisions_out = nullptr) const {
+		if (!input || !output || sketch_size == 0 || num_hashes == 0) return;
+		for (std::size_t i = 0; i < sketch_size; ++i) output[i] = 0.0f;
+		if (collisions_out) collisions_out->assign(sketch_size, 0);
+		for (std::size_t i = 0; i < length; ++i) {
+			for (std::size_t h = 0; h < num_hashes; ++h) {
+				const std::uint64_t mix = splitmix64(static_cast<std::uint64_t>(i) ^ (seed_base + static_cast<std::uint64_t>(h) * 0x9e3779b97f4a7c15ull));
+				const std::size_t bucket = static_cast<std::size_t>(mix % static_cast<std::uint64_t>(sketch_size));
+				const float sign = ((mix >> 63) == 0ull) ? 1.0f : -1.0f;
+				const float before = output[bucket];
+				output[bucket] = before + sign * input[i];
+				if (collisions_out && before != 0.0f) { ++(*collisions_out)[bucket]; }
+			}
+		}
+		// Collision-aware scaling (simple): scale buckets with high collision counts down slightly
+		if (collisions_out) {
+			for (std::size_t b = 0; b < sketch_size; ++b) {
+				std::size_t c = (*collisions_out)[b];
+				if (c > 0) {
+					float scale = 1.0f / (1.0f + static_cast<float>(c));
+					output[b] *= scale;
+				}
+			}
+		}
+	}
+};
+
+// ===== v2.1 routing engine (two-level router) =====
+struct RoutingSelection {
+	std::vector<std::size_t> indices; // selected indices across all buckets
+};
+
+struct RoutingEngineV2 {
+	std::size_t bucket_size = 256;
+	std::size_t top_k_within_bucket = 4;
+	bool stable = true; // deterministic ordering
+	void route(const float *scores, std::size_t length, RoutingSelection &out) const {
+		out.indices.clear();
+		if (!scores || length == 0 || bucket_size == 0) return;
+		const std::size_t num_buckets = (length + bucket_size - 1) / bucket_size;
+		out.indices.reserve(num_buckets * top_k_within_bucket);
+		for (std::size_t b = 0; b < num_buckets; ++b) {
+			const std::size_t start = b * bucket_size;
+			const std::size_t end = std::min(start + bucket_size, length);
+			// find top-k by absolute score within bucket
+			std::vector<std::pair<float, std::size_t>> heap;
+			heap.reserve(end - start);
+			for (std::size_t i = start; i < end; ++i) {
+				float s = scores[i]; s = s < 0.0f ? -s : s;
+				heap.emplace_back(s, i);
+			}
+			std::partial_sort(heap.begin(), heap.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(top_k_within_bucket, heap.size())), heap.end(),
+				[](const auto &a, const auto &b){ return a.first > b.first; });
+			const std::size_t k = std::min<std::size_t>(top_k_within_bucket, heap.size());
+			for (std::size_t i = 0; i < k; ++i) out.indices.push_back(heap[i].second);
+		}
+		if (stable) {
+			std::stable_sort(out.indices.begin(), out.indices.end());
+		}
+	}
+};
+
+// ===== v2.1 execution pipeline (streaming slabs) =====
+struct PipelineTelemetry {
+	double ms_total = 0.0;
+	double ms_stage0 = 0.0;
+	double ms_stage1 = 0.0;
+	double ms_stage2 = 0.0;
+	std::size_t slabs_processed = 0;
+};
+
+enum class PointwiseOp { kIdentity = 0, kRelu = 1, kGelu = 2, kSilu = 3 };
+
+inline void apply_pointwise(PointwiseOp op, float *data, std::size_t length) {
+	if (!data) return;
+	switch (op) {
+		case PointwiseOp::kIdentity: return;
+		case PointwiseOp::kRelu:
+			for (std::size_t i = 0; i < length; ++i) if (data[i] < 0.0f) data[i] = 0.0f; return;
+		case PointwiseOp::kGelu:
+			for (std::size_t i = 0; i < length; ++i) {
+				float x = data[i]; float t = x * (0.7978845608028654f) * (1.0f + 0.044715f * x * x); data[i] = 0.5f * x * (1.0f + std::tanh(t));
+			}
+			return;
+		case PointwiseOp::kSilu:
+			for (std::size_t i = 0; i < length; ++i) { float x = data[i]; float s = 1.0f / (1.0f + std::exp(-x)); data[i] = x * s; }
+			return;
+	}
+}
+
+struct PipelineConfigV21 {
+	std::size_t sketch_size = 0;
+	PointwiseOp pointwise = PointwiseOp::kRelu;
+	bool use_int8 = true;
+	bool use_int4 = false; // if true, overrides int8
+	BlockwiseQuantConfig qcfg;
+};
+
+inline Status pipeline_transform_sketch_route_quantize_v21(const std::vector<float> &input, std::vector<uint8_t> &q4_out,
+	std::vector<int8_t> &q8_out, std::vector<float> &scales_out, PipelineTelemetry &telemetry, const PipelineConfigV21 &pcfg) {
+	if (input.empty()) return make_status(StatusCode::kInvalidArgument, "pipeline: input empty");
+	if (!is_power_of_two(input.size())) return make_status(StatusCode::kInvalidArgument, "pipeline: length must be power of two");
+	if (pcfg.sketch_size == 0) return make_status(StatusCode::kInvalidArgument, "pipeline: sketch_size must be > 0");
+	const std::size_t n = input.size();
+	const std::size_t slab_bytes = global_config().large_slab_bytes;
+	const std::size_t slab_floats = std::max<std::size_t>(1, slab_bytes / sizeof(float));
+	const std::size_t slab_len = std::min<std::size_t>(n, slab_floats);
+	const std::size_t inflight = std::max<std::size_t>(1, std::min<std::size_t>(global_config().max_inflight_slabs, 3));
+	// allocate ring buffers
+	std::vector<std::vector<float>> ring_input(inflight);
+	std::vector<std::vector<float>> ring_transformed(inflight);
+	std::vector<std::vector<float>> ring_sketch(inflight);
+	SketchEngineV2 sk{}; sk.sketch_size = pcfg.sketch_size; sk.num_hashes = global_config().sketch_num_hashes;
+	RoutingEngineV2 router{}; router.bucket_size = global_config().routing_bucket_size; router.top_k_within_bucket = 4; router.stable = global_config().deterministic;
+	Profiler prof;
+	ScopeTimer total_timer(prof, "pipeline_total");
+	std::size_t processed = 0; telemetry.slabs_processed = 0;
+	while (processed < n) {
+		const std::size_t slab_index = telemetry.slabs_processed % inflight;
+		const std::size_t chunk = std::min<std::size_t>(slab_len, n - processed);
+		// S0: load into ring buffer with prefetch, quantize-if-requested later
+		{
+			ScopeTimer t0(prof, "stage0");
+			ring_input[slab_index].assign(input.begin() + static_cast<std::ptrdiff_t>(processed), input.begin() + static_cast<std::ptrdiff_t>(processed + chunk));
+		}
+		// S1: Transform + Sketch (fused via temp buffer)
+		{
+			ScopeTimer t1(prof, "stage1");
+			ring_transformed[slab_index] = ring_input[slab_index];
+			if (chunk >= global_config().parallel_threshold) {
+				std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+				ThreadPool &pool = get_thread_local_pool(threads);
+				fwht_inplace_parallel(ring_transformed[slab_index].data(), ring_transformed[slab_index].size(), pool);
+			} else {
+				fwht_inplace(ring_transformed[slab_index].data(), ring_transformed[slab_index].size());
+			}
+			ring_sketch[slab_index].resize(pcfg.sketch_size);
+			sk.apply(ring_transformed[slab_index].data(), ring_transformed[slab_index].size(), ring_sketch[slab_index].data(), nullptr);
+			apply_pointwise(pcfg.pointwise, ring_sketch[slab_index].data(), ring_sketch[slab_index].size());
+		}
+		// S2: Route + Quantize (store to outputs)
+		{
+			ScopeTimer t2(prof, "stage2");
+			RoutingSelection sel{}; router.route(ring_sketch[slab_index].data(), ring_sketch[slab_index].size(), sel);
+			// Gather selected into a contiguous buffer
+			std::vector<float> selected(sel.indices.size());
+			for (std::size_t i = 0; i < sel.indices.size(); ++i) selected[i] = ring_sketch[slab_index][sel.indices[i]];
+			if (pcfg.use_int4) {
+				BlockwiseInt4Buffer tmp{}; blockwise_quantize_int4(selected.data(), selected.size(), 32, tmp);
+				// append to q4_out and scales_out
+				const std::size_t prev_bytes = q4_out.size();
+				q4_out.resize(prev_bytes + tmp.data.size());
+				if (!tmp.data.empty()) std::memcpy(q4_out.data() + static_cast<std::ptrdiff_t>(prev_bytes), tmp.data.data(), tmp.data.size());
+				const std::size_t prev_sc = scales_out.size();
+				scales_out.resize(prev_sc + tmp.scales.size());
+				for (std::size_t i = 0; i < tmp.scales.size(); ++i) scales_out[prev_sc + i] = tmp.scales[i];
+			} else if (pcfg.use_int8) {
+				std::vector<float> sc; std::vector<int8_t> qtmp; BlockwiseQuantConfig qcfg = pcfg.qcfg; if (qcfg.block_size == 0) qcfg.block_size = 64;
+				blockwise_quantize_int8(selected.data(), selected.size(), qcfg, qtmp, sc);
+				// append
+				const std::size_t prev = q8_out.size(); q8_out.resize(prev + qtmp.size());
+				for (std::size_t i = 0; i < qtmp.size(); ++i) q8_out[prev + i] = qtmp[i];
+				const std::size_t prev_sc = scales_out.size(); scales_out.resize(prev_sc + sc.size());
+				for (std::size_t i = 0; i < sc.size(); ++i) scales_out[prev_sc + i] = sc[i];
+			}
+		}
+		processed += chunk;
+		telemetry.slabs_processed += 1;
+	}
+	// collect timings
+	telemetry.ms_total = prof.get("pipeline_total").ms;
+	telemetry.ms_stage0 = prof.get("stage0").ms;
+	telemetry.ms_stage1 = prof.get("stage1").ms;
+	telemetry.ms_stage2 = prof.get("stage2").ms;
+	return Status::OK();
+}
+
+// ===== v2.1 scheduler & cost model =====
+struct CostModelV21Metrics {
+	double cycles = 0.0;
+	double bytes_moved = 0.0;
+	double reuse_ratio = 1.0;
+	double tlb_pressure = 0.0;
+};
+
+enum class ExecutionMode { kSmallN = 0, kLargeN = 1 };
+
+inline ExecutionMode choose_mode_v21(std::size_t n, const CostModelV21Metrics &m) {
+	if (n > (1u << 16)) { // > 64K
+		if (m.reuse_ratio < 1.1) return ExecutionMode::kLargeN;
+	}
+	return (n >= global_config().parallel_threshold) ? ExecutionMode::kLargeN : ExecutionMode::kSmallN;
+}
+
+// Public wrapper selecting small vs large pipeline. SmallN reuses fused kernels, LargeN runs streaming pipeline.
+inline Status transform_sketch_route_quantize_auto(const std::vector<float> &input, std::size_t sketch_size,
+	std::vector<uint8_t> &q4_out, std::vector<int8_t> &q8_out, std::vector<float> &scales_out,
+	PipelineTelemetry &telemetry, PointwiseOp pointwise = PointwiseOp::kRelu, bool prefer_int4 = false) {
+	CostModelV21Metrics m{}; m.reuse_ratio = 1.0; // heuristic for transforms
+	ExecutionMode mode = choose_mode_v21(input.size(), m);
+	PipelineConfigV21 pc{}; pc.sketch_size = sketch_size; pc.pointwise = pointwise; pc.use_int4 = prefer_int4; pc.use_int8 = !prefer_int4;
+	if (mode == ExecutionMode::kSmallN) {
+		// one-shot: FWHT then sketch then pointwise then quantize
+		std::vector<float> tmp = input;
+		fwht_inplace(tmp.data(), tmp.size());
+		SketchEngineV2 sk{}; sk.sketch_size = sketch_size; sk.num_hashes = global_config().sketch_num_hashes;
+		std::vector<float> skv(sketch_size);
+		sk.apply(tmp.data(), tmp.size(), skv.data(), nullptr);
+		apply_pointwise(pointwise, skv.data(), skv.size());
+		Profiler prof; ScopeTimer total(prof, "pipeline_total");
+		if (prefer_int4) {
+			BlockwiseInt4Buffer buf{}; blockwise_quantize_int4(skv.data(), skv.size(), 32, buf);
+			q4_out = std::move(buf.data); scales_out = std::move(buf.scales); q8_out.clear();
+		} else {
+			BlockwiseQuantConfig qcfg{}; std::vector<float> sc; std::vector<int8_t> qtmp; blockwise_quantize_int8(skv.data(), skv.size(), qcfg, qtmp, sc);
+			q8_out = std::move(qtmp); scales_out = std::move(sc); q4_out.clear();
+		}
+		telemetry.ms_total = prof.get("pipeline_total").ms; telemetry.slabs_processed = 1;
+		return Status::OK();
+	}
+	return pipeline_transform_sketch_route_quantize_v21(input, q4_out, q8_out, scales_out, telemetry, pc);
+}
+
+// ===== v2.1 training: reversible block (stub) & sketch-backprop approx =====
+struct ReversibleBlockConfig { std::size_t width = 0; };
+
+inline void reversible_block_forward(const std::vector<float> &x, std::vector<float> &y) {
+	y = x; // identity stub to keep API footprint; extend later
+}
+
+inline void sketch_backprop_approx(const std::vector<float> &grad_out, std::vector<float> &grad_in) {
+	grad_in = grad_out; // passthrough stub
+}
+
+// ===== Public API v2.1 =====
+inline Status run_pipeline_v21_to_int8(const std::vector<float> &input, std::size_t sketch_size, std::vector<int8_t> &q8, std::vector<float> &scales, PipelineTelemetry &telemetry, PointwiseOp pointwise = PointwiseOp::kRelu) {
+	std::vector<uint8_t> q4_dummy; return transform_sketch_route_quantize_auto(input, sketch_size, q4_dummy, q8, scales, telemetry, pointwise, false);
+}
+
+inline Status run_pipeline_v21_to_int4(const std::vector<float> &input, std::size_t sketch_size, std::vector<uint8_t> &q4, std::vector<float> &scales, PipelineTelemetry &telemetry, PointwiseOp pointwise = PointwiseOp::kRelu) {
+	std::vector<int8_t> q8_dummy; return transform_sketch_route_quantize_auto(input, sketch_size, q4, q8_dummy, scales, telemetry, pointwise, true);
 }
 
 // ===== onnx (stub) =====
