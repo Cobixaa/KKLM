@@ -178,6 +178,8 @@ struct Config {
 	bool enable_pipeline_nt_stores = true; // allow non-temporal stores at pipeline edges
 	std::size_t sketch_num_hashes = 3; // CountSketch hashes for v2 path
 	std::size_t routing_bucket_size = 256; // elements per routing bucket (approx L2 tile)
+	// v2.2 additions
+	bool enable_gpu = false; // optional GPU backend toggles (requires compile-time support)
 };
 
 inline Config & global_config() {
@@ -212,6 +214,8 @@ inline void set_prefer_hugepages(bool enable) { global_config().prefer_hugepages
 inline void set_pipeline_nt_stores(bool enable) { global_config().enable_pipeline_nt_stores = enable; }
 inline void set_sketch_num_hashes(std::size_t h) { global_config().sketch_num_hashes = (h < 1 ? 1 : (h > 4 ? 4 : h)); }
 inline void set_routing_bucket_size(std::size_t b) { global_config().routing_bucket_size = (b == 0 ? 256 : b); }
+// v2.2 setter
+inline void set_enable_gpu(bool enable) { global_config().enable_gpu = enable; }
 
 // ===== memory =====
 struct FreeDeleter {
@@ -487,10 +491,17 @@ inline void dequantize_int8(const int8_t *input, std::size_t length, float scale
 	}
 }
 
+// Forward declaration for optional GPU FWHT (defined later)
+inline Status fwht_inplace_opencl(float *data, std::size_t length);
 // ===== fast_transform (FWHT) =====
 KLLM_INLINE void fwht_inplace(float * KLLM_RESTRICT data, std::size_t length) {
 	if (data == nullptr || !is_power_of_two(length)) {
 		return;
+	}
+	// Optional GPU path for large inputs (best-effort)
+	if (global_config().enable_gpu && length >= global_config().parallel_threshold) {
+		Status st = fwht_inplace_opencl(data, length);
+		if (st.ok()) return; // fallback to CPU if not available
 	}
 	for (std::size_t half_block = 1; half_block < length; half_block <<= 1) {
 		const std::size_t full_block = half_block << 1;
@@ -1322,23 +1333,45 @@ inline void blockwise_quantize_int8(const float *input, std::size_t length, cons
 	const std::size_t num_blocks = (length + bs - 1) / bs;
 	q.resize(length);
 	scales.resize(num_blocks);
-	for (std::size_t b = 0; b < num_blocks; ++b) {
-		const std::size_t start = b * bs;
-		const std::size_t end = std::min(start + bs, length);
-		float max_abs = 0.0f;
-		for (std::size_t i = start; i < end; ++i) {
-			float v = input[i]; v = v < 0.0f ? -v : v; if (v > max_abs) max_abs = v;
+	const bool do_parallel = (length >= global_config().parallel_threshold);
+	if (!do_parallel) {
+		for (std::size_t b = 0; b < num_blocks; ++b) {
+			const std::size_t start = b * bs;
+			const std::size_t end = std::min(start + bs, length);
+			float max_abs = 0.0f;
+			for (std::size_t i = start; i < end; ++i) { float v = input[i]; v = v < 0.0f ? -v : v; if (v > max_abs) max_abs = v; }
+			float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 127.0f);
+			if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
+			scales[b] = s;
+			const float inv = 1.0f / s;
+			for (std::size_t i = start; i < end; ++i) {
+				int vi = static_cast<int>(input[i] * inv + (input[i] >= 0.0f ? 0.5f : -0.5f));
+				if (vi > 127) vi = 127; if (vi < -127) vi = -127;
+				q[i] = static_cast<int8_t>(vi);
+			}
 		}
-		float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 127.0f);
-		if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
-		scales[b] = s;
-		const float inv = 1.0f / s;
-		for (std::size_t i = start; i < end; ++i) {
-			int vi = static_cast<int>(input[i] * inv + (input[i] >= 0.0f ? 0.5f : -0.5f));
-			if (vi > 127) vi = 127; if (vi < -127) vi = -127;
-			q[i] = static_cast<int8_t>(vi);
-		}
+		return;
 	}
+	std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+	ThreadPool &pool = get_thread_local_pool(threads);
+	for (std::size_t b = 0; b < num_blocks; ++b) {
+		pool.enqueue([&, b]() {
+			const std::size_t start = b * bs;
+			const std::size_t end = std::min(start + bs, length);
+			float max_abs = 0.0f;
+			for (std::size_t i = start; i < end; ++i) { float v = input[i]; v = v < 0.0f ? -v : v; if (v > max_abs) max_abs = v; }
+			float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 127.0f);
+			if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
+			scales[b] = s;
+			const float inv = 1.0f / s;
+			for (std::size_t i = start; i < end; ++i) {
+				int vi = static_cast<int>(input[i] * inv + (input[i] >= 0.0f ? 0.5f : -0.5f));
+				if (vi > 127) vi = 127; if (vi < -127) vi = -127;
+				q[i] = static_cast<int8_t>(vi);
+			}
+		});
+	}
+	pool.wait();
 }
 
 inline void blockwise_dequantize_int8(const int8_t *q, std::size_t length, const BlockwiseQuantConfig &cfg,
@@ -1388,23 +1421,46 @@ inline void blockwise_quantize_int4(const float *input, std::size_t length, std:
 	out.original_length = length; out.block_size = bs; out.scales.resize(num_blocks);
 	const std::size_t packed_per_block = (bs + 1) / 2;
 	out.data.resize(num_blocks * packed_per_block);
-	for (std::size_t b = 0; b < num_blocks; ++b) {
-		const std::size_t start = b * bs;
-		const std::size_t end = std::min(start + bs, length);
-		float max_abs = 0.0f;
-		for (std::size_t i = start; i < end; ++i) { float v = input[i]; v = v < 0.0f ? -v : v; if (v > max_abs) max_abs = v; }
-		float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 7.0f);
-		if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
-		out.scales[b] = s;
-		const float inv = 1.0f / s;
-		for (std::size_t i = start, k = 0; i < end; i += 2, ++k) {
-			int v0 = static_cast<int>(input[i] * inv + (input[i] >= 0.0f ? 0.5f : -0.5f));
-			int v1 = 0;
-			if (i + 1 < end) v1 = static_cast<int>(input[i + 1] * inv + (input[i + 1] >= 0.0f ? 0.5f : -0.5f));
-			out.data[b * packed_per_block + k] = pack_int4_pair(v0, v1);
+	const bool do_parallel = (length >= global_config().parallel_threshold);
+	if (!do_parallel) {
+		for (std::size_t b = 0; b < num_blocks; ++b) {
+			const std::size_t start = b * bs;
+			const std::size_t end = std::min(start + bs, length);
+			float max_abs = 0.0f;
+			for (std::size_t i = start; i < end; ++i) { float v = input[i]; v = v < 0.0f ? -v : v; if (v > max_abs) max_abs = v; }
+			float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 7.0f);
+			if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
+			out.scales[b] = s;
+			const float inv = 1.0f / s;
+			for (std::size_t i = start, k = 0; i < end; i += 2, ++k) {
+				int v0 = static_cast<int>(input[i] * inv + (input[i] >= 0.0f ? 0.5f : -0.5f));
+				int v1 = 0;
+				if (i + 1 < end) v1 = static_cast<int>(input[i + 1] * inv + (input[i + 1] >= 0.0f ? 0.5f : -0.5f));
+				out.data[b * packed_per_block + k] = pack_int4_pair(v0, v1);
+			}
 		}
-		// If odd tail, last high nibble corresponds to missing element; treat as 0 in dequant
+		return;
 	}
+	std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+	ThreadPool &pool = get_thread_local_pool(threads);
+	for (std::size_t b = 0; b < num_blocks; ++b) {
+		pool.enqueue([&, b]() {
+			const std::size_t start = b * bs;
+			const std::size_t end = std::min(start + bs, length);
+			float max_abs = 0.0f;
+			for (std::size_t i = start; i < end; ++i) { float v = input[i]; v = v < 0.0f ? -v : v; if (v > max_abs) max_abs = v; }
+			float s = (max_abs <= 1e-8f) ? 1.0f : (max_abs / 7.0f);
+			if (!std::isfinite(s) || s <= 0.0f) s = 1.0f;
+			out.scales[b] = s;
+			const float inv = 1.0f / s;
+			for (std::size_t i = start, k = 0; i < end; i += 2, ++k) {
+				int v0 = static_cast<int>(input[i] * inv + (input[i] >= 0.0f ? 0.5f : -0.5f));
+				int v1 = 0; if (i + 1 < end) v1 = static_cast<int>(input[i + 1] * inv + (input[i + 1] >= 0.0f ? 0.5f : -0.5f));
+				out.data[b * packed_per_block + k] = pack_int4_pair(v0, v1);
+			}
+		});
+	}
+	pool.wait();
 }
 
 inline void blockwise_dequantize_int4(const BlockwiseInt4Buffer &in, std::vector<float> &out) {
@@ -1435,27 +1491,72 @@ struct SketchEngineV2 {
 		if (!input || !output || sketch_size == 0 || num_hashes == 0) return;
 		for (std::size_t i = 0; i < sketch_size; ++i) output[i] = 0.0f;
 		if (collisions_out) collisions_out->assign(sketch_size, 0);
-		for (std::size_t i = 0; i < length; ++i) {
-			for (std::size_t h = 0; h < num_hashes; ++h) {
-				const std::uint64_t mix = splitmix64(static_cast<std::uint64_t>(i) ^ (seed_base + static_cast<std::uint64_t>(h) * 0x9e3779b97f4a7c15ull));
-				const std::size_t bucket = static_cast<std::size_t>(mix % static_cast<std::uint64_t>(sketch_size));
-				const float sign = ((mix >> 63) == 0ull) ? 1.0f : -1.0f;
-				const float before = output[bucket];
-				output[bucket] = before + sign * input[i];
-				if (collisions_out && before != 0.0f) { ++(*collisions_out)[bucket]; }
-			}
-		}
-		// Collision-aware scaling (simple): scale buckets with high collision counts down slightly
-		if (collisions_out) {
-			for (std::size_t b = 0; b < sketch_size; ++b) {
-				std::size_t c = (*collisions_out)[b];
-				if (c > 0) {
-					float scale = 1.0f / (1.0f + static_cast<float>(c));
-					output[b] *= scale;
+		// Parallelize when large enough
+		const std::size_t threshold = global_config().parallel_threshold;
+		const bool do_parallel = (length >= threshold);
+		if (!do_parallel) {
+			for (std::size_t i = 0; i < length; ++i) {
+				for (std::size_t h = 0; h < num_hashes; ++h) {
+					const std::uint64_t mix = splitmix64(static_cast<std::uint64_t>(i) ^ (seed_base + static_cast<std::uint64_t>(h) * 0x9e3779b97f4a7c15ull));
+					const std::size_t bucket = static_cast<std::size_t>(mix % static_cast<std::uint64_t>(sketch_size));
+					const float sign = ((mix >> 63) == 0ull) ? 1.0f : -1.0f;
+					const float before = output[bucket];
+					output[bucket] = before + sign * input[i];
+					if (collisions_out && before != 0.0f) { ++(*collisions_out)[bucket]; }
 				}
 			}
+			// Collision-aware scaling (simple): scale buckets with high collision counts down slightly
+			if (collisions_out) {
+				for (std::size_t b = 0; b < sketch_size; ++b) {
+					std::size_t c = (*collisions_out)[b];
+					if (c > 0) { float scale = 1.0f / (1.0f + static_cast<float>(c)); output[b] *= scale; }
+				}
+			}
+			return;
+		}
+		// Parallel path: thread-local accumulators, final reduction
+		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+		ThreadPool &pool = get_thread_local_pool(threads);
+		std::vector<std::vector<float>> local(threads, std::vector<float>(sketch_size, 0.0f));
+		std::vector<std::vector<std::size_t>> local_coll;
+		if (collisions_out) local_coll.assign(threads, std::vector<std::size_t>(sketch_size, 0));
+		const std::size_t chunk = (length + threads - 1) / threads;
+		for (std::size_t t = 0; t < threads; ++t) {
+			const std::size_t start = t * chunk;
+			if (start >= length) continue;
+			const std::size_t end = std::min(start + chunk, length);
+			pool.enqueue([&, t, start, end]() {
+				float *out_t = local[t].data();
+				std::size_t *coll_t = collisions_out ? local_coll[t].data() : nullptr;
+				for (std::size_t i = start; i < end; ++i) {
+					for (std::size_t h = 0; h < num_hashes; ++h) {
+						const std::uint64_t mix = splitmix64(static_cast<std::uint64_t>(i) ^ (seed_base + static_cast<std::uint64_t>(h) * 0x9e3779b97f4a7c15ull));
+						const std::size_t bucket = static_cast<std::size_t>(mix % static_cast<std::uint64_t>(sketch_size));
+						const float sign = ((mix >> 63) == 0ull) ? 1.0f : -1.0f;
+						const float before = out_t[bucket];
+						out_t[bucket] = before + sign * input[i];
+						if (coll_t && before != 0.0f) { coll_t[bucket] += 1; }
+					}
+				}
+			});
+		}
+		pool.wait();
+		// Reduce
+		for (std::size_t b = 0; b < sketch_size; ++b) {
+			float acc = 0.0f;
+			for (std::size_t t = 0; t < threads; ++t) acc += local[t][b];
+			output[b] = acc;
+		}
+		if (collisions_out) {
+			for (std::size_t b = 0; b < sketch_size; ++b) {
+				std::size_t c = 0;
+				for (std::size_t t = 0; t < threads; ++t) c += local_coll[t][b];
+				(*collisions_out)[b] = c;
+			}
+			for (std::size_t b = 0; b < sketch_size; ++b) { if ((*collisions_out)[b] > 0) { output[b] *= 1.0f / (1.0f + static_cast<float>((*collisions_out)[b])); } }
 		}
 	}
+private:
 };
 
 // ===== v2.1 routing engine (two-level router) =====
@@ -1471,21 +1572,49 @@ struct RoutingEngineV2 {
 		out.indices.clear();
 		if (!scores || length == 0 || bucket_size == 0) return;
 		const std::size_t num_buckets = (length + bucket_size - 1) / bucket_size;
-		out.indices.reserve(num_buckets * top_k_within_bucket);
-		for (std::size_t b = 0; b < num_buckets; ++b) {
-			const std::size_t start = b * bucket_size;
-			const std::size_t end = std::min(start + bucket_size, length);
-			// find top-k by absolute score within bucket
-			std::vector<std::pair<float, std::size_t>> heap;
-			heap.reserve(end - start);
-			for (std::size_t i = start; i < end; ++i) {
-				float s = scores[i]; s = s < 0.0f ? -s : s;
-				heap.emplace_back(s, i);
+		std::vector<std::vector<std::size_t>> per_bucket(num_buckets);
+		const bool do_parallel = (length >= global_config().parallel_threshold);
+		if (do_parallel) {
+			std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+			ThreadPool &pool = get_thread_local_pool(threads);
+			for (std::size_t b = 0; b < num_buckets; ++b) {
+				pool.enqueue([&, b]() {
+					const std::size_t start = b * bucket_size;
+					const std::size_t end = std::min(start + bucket_size, length);
+					std::vector<std::pair<float, std::size_t>> heap;
+					heap.reserve(end - start);
+					for (std::size_t i = start; i < end; ++i) {
+						float s = scores[i]; s = s < 0.0f ? -s : s;
+						heap.emplace_back(s, i);
+					}
+					const std::size_t k = std::min<std::size_t>(top_k_within_bucket, heap.size());
+					std::partial_sort(heap.begin(), heap.begin() + static_cast<std::ptrdiff_t>(k), heap.end(),
+						[](const auto &a, const auto &b){ return a.first > b.first; });
+					per_bucket[b].reserve(k);
+					for (std::size_t i = 0; i < k; ++i) per_bucket[b].push_back(heap[i].second);
+				});
 			}
-			std::partial_sort(heap.begin(), heap.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(top_k_within_bucket, heap.size())), heap.end(),
-				[](const auto &a, const auto &b){ return a.first > b.first; });
-			const std::size_t k = std::min<std::size_t>(top_k_within_bucket, heap.size());
-			for (std::size_t i = 0; i < k; ++i) out.indices.push_back(heap[i].second);
+			pool.wait();
+		} else {
+			for (std::size_t b = 0; b < num_buckets; ++b) {
+				const std::size_t start = b * bucket_size;
+				const std::size_t end = std::min(start + bucket_size, length);
+				std::vector<std::pair<float, std::size_t>> heap;
+				heap.reserve(end - start);
+				for (std::size_t i = start; i < end; ++i) { float s = scores[i]; s = s < 0.0f ? -s : s; heap.emplace_back(s, i); }
+				const std::size_t k = std::min<std::size_t>(top_k_within_bucket, heap.size());
+				std::partial_sort(heap.begin(), heap.begin() + static_cast<std::ptrdiff_t>(k), heap.end(),
+					[](const auto &a, const auto &b){ return a.first > b.first; });
+				per_bucket[b].reserve(k);
+				for (std::size_t i = 0; i < k; ++i) per_bucket[b].push_back(heap[i].second);
+			}
+		}
+		// Flatten
+		std::size_t total = 0; for (const auto &v : per_bucket) total += v.size();
+		out.indices.resize(total);
+		std::size_t pos = 0;
+		for (std::size_t b = 0; b < num_buckets; ++b) {
+			for (std::size_t idx : per_bucket[b]) out.indices[pos++] = idx;
 		}
 		if (stable) {
 			std::stable_sort(out.indices.begin(), out.indices.end());
@@ -1539,10 +1668,11 @@ inline Status pipeline_transform_sketch_route_quantize_v21(const std::vector<flo
 	const std::size_t slab_floats = std::max<std::size_t>(1, slab_bytes / sizeof(float));
 	const std::size_t slab_len = std::min<std::size_t>(n, slab_floats);
 	const std::size_t inflight = std::max<std::size_t>(1, std::min<std::size_t>(global_config().max_inflight_slabs, 3));
-	// allocate ring buffers
+	// allocate ring buffers (reserve for reuse)
 	std::vector<std::vector<float>> ring_input(inflight);
 	std::vector<std::vector<float>> ring_transformed(inflight);
 	std::vector<std::vector<float>> ring_sketch(inflight);
+	for (std::size_t r = 0; r < inflight; ++r) { ring_input[r].reserve(slab_len); ring_transformed[r].reserve(slab_len); ring_sketch[r].reserve(pcfg.sketch_size); }
 	SketchEngineV2 sk{}; sk.sketch_size = pcfg.sketch_size; sk.num_hashes = global_config().sketch_num_hashes;
 	RoutingEngineV2 router{}; router.bucket_size = global_config().routing_bucket_size; router.top_k_within_bucket = 4; router.stable = global_config().deterministic;
 	Profiler prof;
@@ -1551,12 +1681,13 @@ inline Status pipeline_transform_sketch_route_quantize_v21(const std::vector<flo
 	while (processed < n) {
 		const std::size_t slab_index = telemetry.slabs_processed % inflight;
 		const std::size_t chunk = std::min<std::size_t>(slab_len, n - processed);
-		// S0: load into ring buffer with prefetch, quantize-if-requested later
+		// S0: load into ring buffer (memcpy to reuse capacity)
 		{
 			ScopeTimer t0(prof, "stage0");
-			ring_input[slab_index].assign(input.begin() + static_cast<std::ptrdiff_t>(processed), input.begin() + static_cast<std::ptrdiff_t>(processed + chunk));
+			ring_input[slab_index].resize(chunk);
+			std::memcpy(ring_input[slab_index].data(), input.data() + static_cast<std::ptrdiff_t>(processed), chunk * sizeof(float));
 		}
-		// S1: Transform + Sketch (fused via temp buffer)
+		// S1: Transform + Sketch
 		{
 			ScopeTimer t1(prof, "stage1");
 			ring_transformed[slab_index] = ring_input[slab_index];
@@ -1571,7 +1702,7 @@ inline Status pipeline_transform_sketch_route_quantize_v21(const std::vector<flo
 			sk.apply(ring_transformed[slab_index].data(), ring_transformed[slab_index].size(), ring_sketch[slab_index].data(), nullptr);
 			apply_pointwise(pcfg.pointwise, ring_sketch[slab_index].data(), ring_sketch[slab_index].size());
 		}
-		// S2: Route + Quantize (store to outputs)
+		// S2: Route + Quantize
 		{
 			ScopeTimer t2(prof, "stage2");
 			RoutingSelection sel{}; router.route(ring_sketch[slab_index].data(), ring_sketch[slab_index].size(), sel);
@@ -1683,5 +1814,67 @@ inline Status import_onnx_model(const std::string &path) {
 	}
 	return Status::OK();
 }
+
+// ===== Optional GPU FWHT (stub; requires compile-time enable) =====
+#if defined(KLLM_USE_OPENCL)
+#include <CL/cl.h>
+namespace detail {
+	static const char *kFwhtKernel = R"CLC(
+	__kernel void fwht_stage(__global float* data, const int n, const int half_block) {
+		int gid = get_global_id(0);
+		int full_block = half_block << 1;
+		int block = gid / half_block;
+		int i = gid % half_block;
+		int a_idx = block * full_block + i;
+		int b_idx = a_idx + half_block;
+		if (b_idx < n) {
+			float a = data[a_idx];
+			float b = data[b_idx];
+			data[a_idx] = a + b;
+			data[b_idx] = a - b;
+		}
+	}
+	)CLC";
+}
+inline Status fwht_inplace_opencl(float *data, std::size_t length) {
+	if (!data || !is_power_of_two(length)) return make_status(StatusCode::kInvalidArgument, "OpenCL FWHT: invalid input");
+	cl_int err = 0;
+	cl_uint num_platforms = 0; err = clGetPlatformIDs(0, nullptr, &num_platforms); if (err != CL_SUCCESS || num_platforms == 0) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: no platform");
+	std::vector<cl_platform_id> plats(num_platforms); err = clGetPlatformIDs(num_platforms, plats.data(), nullptr); if (err != CL_SUCCESS) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clGetPlatformIDs failed");
+	cl_platform_id platform = plats[0];
+	cl_uint num_devices = 0; err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices); if (err != CL_SUCCESS || num_devices == 0) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: no GPU device");
+	std::vector<cl_device_id> devs(num_devices); err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devs.data(), nullptr); if (err != CL_SUCCESS) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clGetDeviceIDs failed");
+	cl_device_id dev = devs[0];
+	cl_context ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err); if (!ctx || err != CL_SUCCESS) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateContext failed");
+	cl_command_queue q = clCreateCommandQueue(ctx, dev, 0, &err); if (!q || err != CL_SUCCESS) { clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateCommandQueue failed"); }
+	const char *src = detail::kFwhtKernel; size_t srclen = std::strlen(src);
+	cl_program prog = clCreateProgramWithSource(ctx, 1, &src, &srclen, &err); if (!prog || err != CL_SUCCESS) { clReleaseCommandQueue(q); clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateProgramWithSource failed"); }
+	err = clBuildProgram(prog, 1, &dev, "", nullptr, nullptr);
+	if (err != CL_SUCCESS) { clReleaseProgram(prog); clReleaseCommandQueue(q); clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clBuildProgram failed"); }
+	cl_kernel kernel = clCreateKernel(prog, "fwht_stage", &err); if (!kernel || err != CL_SUCCESS) { clReleaseProgram(prog); clReleaseCommandQueue(q); clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateKernel failed"); }
+	cl_mem buf = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, length * sizeof(float), data, &err); if (!buf || err != CL_SUCCESS) { clReleaseKernel(kernel); clReleaseProgram(prog); clReleaseCommandQueue(q); clReleaseContext(ctx); return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: clCreateBuffer failed"); }
+	for (std::size_t half_block = 1; half_block < length; half_block <<= 1) {
+		int n_int = static_cast<int>(length);
+		int hb_int = static_cast<int>(half_block);
+		err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &buf); if (err != CL_SUCCESS) break;
+		err = clSetKernelArg(kernel, 1, sizeof(int), &n_int); if (err != CL_SUCCESS) break;
+		err = clSetKernelArg(kernel, 2, sizeof(int), &hb_int); if (err != CL_SUCCESS) break;
+		size_t global = (length / (half_block << 1)) * half_block; if (global == 0) global = half_block;
+		err = clEnqueueNDRangeKernel(q, kernel, 1, nullptr, &global, nullptr, 0, nullptr, nullptr); if (err != CL_SUCCESS) break;
+	}
+	err = clEnqueueReadBuffer(q, buf, CL_TRUE, 0, length * sizeof(float), data, 0, nullptr, nullptr);
+	clReleaseMemObject(buf);
+	clReleaseKernel(kernel);
+	clReleaseProgram(prog);
+	clReleaseCommandQueue(q);
+	clReleaseContext(ctx);
+	if (err != CL_SUCCESS) return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT: kernel enqueue/read failed");
+	return Status::OK();
+}
+#else
+inline Status fwht_inplace_opencl(float *data, std::size_t length) {
+	(void)data; (void)length; return make_status(StatusCode::kFailedPrecondition, "OpenCL FWHT disabled. Compile with -DKLLM_USE_OPENCL.");
+}
+#endif
 
 } // namespace kllm
