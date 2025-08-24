@@ -12,6 +12,9 @@ KLLM (Key-Light Large Model) is a CPU-first, C++17 header-only library providing
 - Tiny IR + planner that fuses Transform+Relu
 - int8 quantization helpers (scale selection, encode/decode)
 - Lightweight thread pool and parallel FWHT
+- Extended error handling: errno-aware messages, `StatusOr<T>`, guard macros
+- Config extensions: `parallel_threshold`, `pin_threads`, reusable thread-local pool
+- Optimized fused kernels: automatic parallel FWHT for large inputs
 
 ---
 
@@ -152,16 +155,16 @@ ALL TESTS PASSED
 
 ### Benchmark Results (this environment)
 ```
-FWHT 1M floats: 8.20489 ms (7.82479 ns/elem)
-FWHT(par,4) 1M floats: 3.58342 ms (3.41742 ns/elem)
-Fused FWHT-scale-add 1M: 10.4894 ms (10.0035 ns/elem)
-FWHT 2048 floats: 12916 ns (6.30664 ns/elem)
-Fused FWHT-scale-add 2048: 13177 ns (6.43408 ns/elem)
-NTT 262k uint32: 8.06189 ms (30.7537 ns/elem)
-CountSketch 1M -> 262k (3 hashes): 4.15962 ms (3.96692 ns/elem)
-BlockDiag float 1024x(16x16): 0.052263 ms (3.18988 ns/elem)
-BlockDiag int8 1024x(16x16): 0.046482 ms (2.83704 ns/elem)
-LowRank 4096x4096 (r=64): 3.9e-05 ms (0.00952148 ns/elem)
+FWHT 1M floats: 8.3327 ms (7.94668 ns/elem)
+FWHT(par,4) 1M floats: 3.90141 ms (3.72067 ns/elem)
+Fused FWHT-scale-add 1M: 7.92068 ms (7.55375 ns/elem)
+FWHT 2048 floats: 12885 ns (6.2915 ns/elem)
+Fused FWHT-scale-add 2048: 13463 ns (6.57373 ns/elem)
+NTT 262k uint32: 4.46424 ms (17.0297 ns/elem)
+CountSketch 1M -> 262k (3 hashes): 4.12869 ms (3.93743 ns/elem)
+BlockDiag float 1024x(16x16): 0.051773 ms (3.15997 ns/elem)
+BlockDiag int8 1024x(16x16): 0.047225 ms (2.88239 ns/elem)
+LowRank 4096x4096 (r=64): 3.1e-05 ms (0.00756836 ns/elem)
 ```
 System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features autodetected. Results vary by CPU.
 
@@ -174,6 +177,7 @@ System: clang++ 20.1.2, -O3 -march=native, Linux kernel 6.12+, CPU features auto
 - Fuse downstream pointwise ops with transforms (see IR planner) to reduce memory traffic.
 - For int8 paths, pack/accumulate in int32 and dequantize late; batch operations for better cache locality.
 - On aarch64, build with `-march=armv8-a+simd`; NEON kernels are enabled automatically.
+- Set `kllm::set_parallel_threshold()` and `kllm::set_num_threads()` to tune parallel fused FWHT. Use `kllm::set_pin_threads(true)` to request worker pinning.
 
 ---
 
