@@ -150,12 +150,30 @@ std::cout << "Loss=" << metrics.loss / metrics.samples
 ```
 
 Available ops and layers:
-- Tensors: `tensor(values, shape, requires_grad)`, `zeros(shape)`, `randn(shape)`
-- Ops: `add`, `mul`, `matmul`, `add_bias`, `relu`, `gelu`, `softmax_lastdim`, losses: `mse_loss`, `cross_entropy_logits`
-- Modules: `Linear`, `Sequential`; utilities: `collect_parameters`, `summary`
-- Optimizers: `SGD(params, lr[, weight_decay])`, `Adam(params, lr)`
-- Data: `TensorDataset::from`, `DataLoader` with batch/shuffle
-- Trainer: `Trainer(cfg).fit(model, loader, optimizer)`
+- Tensors: `tensor(values, shape, requires_grad)`, `zeros(shape)`, `ones(shape)`, `full(shape, value)`, `randu(shape)`, `randn(shape)`
+- Ops: `add`, `mul`, `matmul`, `add_bias`, activations: `relu`, `leaky_relu`, `elu`, `selu`, `gelu`, softmax: `softmax_lastdim`; losses: `mse_loss`, `cross_entropy_logits`
+- Modules: `Linear`, `Sequential`, `Dropout`, `LayerNorm`, `BatchNorm1d`; utilities: `collect_parameters`, `summary`
+- Optimizers: `SGD(params, lr[, weight_decay])`, `Adam(params, lr)`, `RMSprop`, `Adagrad`, `Adadelta`
+- Training helpers: gradient clipping: `clip_grad_norm(params, max_norm)`; LR schedulers: `StepLR`, `CosineAnnealingLR`
+- Data: `TensorDataset::from`, `TensorDatasetReg::from` (regression), `DataLoader`, `DataLoaderReg`
+- Trainer: `Trainer(cfg).fit(model, loader, optimizer)`, `fit_regression(model, loaderReg, optimizer, epochs)`
+
+Notes:
+- Each `nn::Value` exposes a `data()` method for raw access; internal storage is now `values`.
+- `Module::parameters()` returns a vector; `collect_parameters(model)` gathers recursively.
+
+Custom module implementation (example):
+```cpp
+struct MyReluModule : kllm::nn::Module {
+  kllm::nn::ValuePtr forward(const kllm::nn::ValuePtr &x) override { return kllm::nn::relu(x); }
+  std::vector<kllm::nn::ValuePtr> parameters() override { return {}; }
+};
+```
+
+Autograd notes:
+- Backprop builds a DAG of `Value` parents. Call `loss->backward()` to populate `.grad` for tensors with `requires_grad=true`.
+- Gradients flow through ops via stored `backward_fn` lambdas; use `zero_grad()` on parameters before each step.
+- For stability, you can use `clip_grad_norm(params, max_norm)` before optimizer `step()`.
 
 This API is intentionally compact for easy use on mobile/Termux while staying header-only.
 
@@ -163,16 +181,16 @@ This API is intentionally compact for easy use on mobile/Termux while staying he
 
 ### Benchmarks (this build)
 ```text
-FWHT 1M floats: ~8.38 ms
-FWHT(par,4) 1M floats: ~3.12 ms
-Fused FWHT-scale-add 1M: ~6.95 ms
-NTT 262k uint32: ~4.19 ms
-CountSketch 1M -> 262k: ~4.06 ms
+FWHT 1M floats: ~6.17 ms
+FWHT(par,4) 1M floats: ~3.69 ms
+Fused FWHT-scale-add 1M: ~7.21 ms
+NTT 262k uint32: ~4.39 ms
+CountSketch 1M -> 262k: ~4.16 ms
 BlockDiag float 1024x(16x16): ~0.050 ms
 BlockDiag int8 1024x(16x16): ~0.047 ms
 LowRank 4096x4096 (r=64): ~0.000038 ms
-Pipeline v2.1 int8 1M: ~29.00 ms, slabs=4
-Pipeline v2.1 int4 1M: ~26.02 ms, slabs=4
+Pipeline v2.1 int8 1M: ~29.65 ms, slabs=4
+Pipeline v2.1 int4 1M: ~34.58 ms, slabs=4
 ```
 
 Tips:
