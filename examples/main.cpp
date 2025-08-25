@@ -155,6 +155,21 @@ static void test_training() {
 	std::cout << "Training step loss: " << res.loss << ", param0: " << params[0] << "\n";
 }
 
+static void test_nn_regression() {
+	using namespace kllm::nn;
+	// Simple linear regression y = x0 + x1 with noise
+	std::vector<std::vector<float>> X(100, std::vector<float>(2));
+	std::vector<float> Y(100);
+	for (size_t i = 0; i < 100; ++i) { X[i][0] = float(i)*0.01f; X[i][1] = 1.0f; Y[i] = X[i][0] + 0.5f; }
+	auto ds = kllm::nn::TensorDatasetReg::from(X, Y);
+	kllm::nn::DataLoaderReg loader(ds, kllm::nn::DataLoaderConfig{32, true, 123});
+	kllm::nn::Sequential net({ std::make_shared<kllm::nn::Linear>(2, 1) });
+	auto params = kllm::nn::collect_parameters(net);
+	kllm::nn::Adam opt(params, 1e-2f);
+	auto metrics = kllm::nn::fit_regression(net, loader, opt, 3);
+	std::cout << "nn regression avg loss=" << (metrics.samples==0?0.0:metrics.loss/double(metrics.samples)) << "\n";
+}
+
 static void test_pipeline_v21() {
 	std::vector<float> x(1 << 16);
 	std::mt19937 rng(123);
@@ -184,6 +199,7 @@ int main() {
 	test_transforms_extras();
 	test_config_and_onnx();
 	test_training();
+	test_nn_regression();
 	test_pipeline_v21();
 	return 0;
 }
