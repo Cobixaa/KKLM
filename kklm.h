@@ -183,6 +183,13 @@ struct Config {
 	std::size_t sketch_num_hashes = 3; // CountSketch hashes for v2 path
 	std::size_t routing_bucket_size = 256; // elements per routing bucket (approx L2 tile)
 	// v2.2 additions (GPU removed; CPU-only)
+	bool release_tls_fused_buffers = true; // release fused FWHT TLS buffers after each call
+	bool enable_simd = true; // allow using SIMD paths when compiled in
+	// matmul blocking knobs
+	bool enable_matmul_blocked = true;
+	std::size_t matmul_block_m = 64;
+	std::size_t matmul_block_n = 128;
+	std::size_t matmul_block_k = 128;
 };
 
 inline Config & global_config() {
@@ -569,39 +576,38 @@ KLLM_INLINE void fwht_inplace_parallel(float * KLLM_RESTRICT data, std::size_t l
 		parallel_for_blocks(pool, 0, length, full_block, [=](std::size_t block_start) {
 			std::size_t i = 0;
 #if defined(__AVX2__)
-			const std::size_t vec_width = 8;
-			for (; i + vec_width <= half_block; i += vec_width) {
-				float *a_ptr = data + block_start + i;
-				float *b_ptr = data + block_start + i + half_block;
-				prefetch(a_ptr + global_config().prefetch_distance);
-				prefetch(b_ptr + global_config().prefetch_distance);
-				const bool aligned = is_aligned_32(a_ptr) && is_aligned_32(b_ptr);
-				__m256 a = aligned ? _mm256_load_ps(a_ptr) : _mm256_loadu_ps(a_ptr);
-				__m256 b = aligned ? _mm256_load_ps(b_ptr) : _mm256_loadu_ps(b_ptr);
-				__m256 sum = _mm256_add_ps(a, b);
-				__m256 diff = _mm256_sub_ps(a, b);
-				if (aligned) {
-					_mm256_store_ps(a_ptr, sum);
-					_mm256_store_ps(b_ptr, diff);
-				} else {
-					_mm256_storeu_ps(a_ptr, sum);
-					_mm256_storeu_ps(b_ptr, diff);
+			if (global_config().enable_simd) {
+				const std::size_t vec_width = 8;
+				for (; i + vec_width <= half_block; i += vec_width) {
+					float *a_ptr = data + block_start + i;
+					float *b_ptr = data + block_start + i + half_block;
+					prefetch(a_ptr + global_config().prefetch_distance);
+					prefetch(b_ptr + global_config().prefetch_distance);
+					const bool aligned = is_aligned_32(a_ptr) && is_aligned_32(b_ptr);
+					__m256 a = aligned ? _mm256_load_ps(a_ptr) : _mm256_loadu_ps(a_ptr);
+					__m256 b = aligned ? _mm256_load_ps(b_ptr) : _mm256_loadu_ps(b_ptr);
+					__m256 sum = _mm256_add_ps(a, b);
+					__m256 diff = _mm256_sub_ps(a, b);
+					if (aligned) { _mm256_store_ps(a_ptr, sum); _mm256_store_ps(b_ptr, diff); }
+					else { _mm256_storeu_ps(a_ptr, sum); _mm256_storeu_ps(b_ptr, diff); }
 				}
 			}
 #endif
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
-			const std::size_t neon_width = 4;
-			for (; i + neon_width <= half_block; i += neon_width) {
-				float *a_ptr = data + block_start + i;
-				float *b_ptr = data + block_start + i + half_block;
-				prefetch(a_ptr + global_config().prefetch_distance);
-				prefetch(b_ptr + global_config().prefetch_distance);
-				float32x4_t a = vld1q_f32(a_ptr);
-				float32x4_t b = vld1q_f32(b_ptr);
-				float32x4_t sum = vaddq_f32(a, b);
-				float32x4_t diff = vsubq_f32(a, b);
-				vst1q_f32(a_ptr, sum);
-				vst1q_f32(b_ptr, diff);
+			if (global_config().enable_simd) {
+				const std::size_t neon_width = 4;
+				for (; i + neon_width <= half_block; i += neon_width) {
+					float *a_ptr = data + block_start + i;
+					float *b_ptr = data + block_start + i + half_block;
+					prefetch(a_ptr + global_config().prefetch_distance);
+					prefetch(b_ptr + global_config().prefetch_distance);
+					float32x4_t a = vld1q_f32(a_ptr);
+					float32x4_t b = vld1q_f32(b_ptr);
+					float32x4_t sum = vaddq_f32(a, b);
+					float32x4_t diff = vsubq_f32(a, b);
+					vst1q_f32(a_ptr, sum);
+					vst1q_f32(b_ptr, diff);
+				}
 			}
 #endif
 			for (; i < half_block; ++i) {
@@ -635,7 +641,6 @@ KLLM_INLINE void fused_fwht_scale_add(const float * KLLM_RESTRICT input, std::si
 	static thread_local std::vector<float> buffer;
 	buffer.resize(length);
 	std::memcpy(buffer.data(), input, length * sizeof(float));
-	// Use parallel FWHT for large inputs when configured.
 	const bool use_parallel = (length >= global_config().parallel_threshold);
 	if (use_parallel) {
 		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
@@ -670,6 +675,9 @@ KLLM_INLINE void fused_fwht_scale_add(const float * KLLM_RESTRICT input, std::si
 	for (; i < length; ++i) {
 		inout_destination[i] += scale * buffer[i];
 	}
+	if (global_config().release_tls_fused_buffers) {
+		std::vector<float>().swap(buffer);
+	}
 }
 
 KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
@@ -679,7 +687,6 @@ KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const f
 	static thread_local std::vector<float> buffer;
 	buffer.resize(length);
 	std::memcpy(buffer.data(), input, length * sizeof(float));
-	// Use parallel FWHT for large inputs when configured.
 	if (length >= global_config().parallel_threshold) {
 		std::size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
 		ThreadPool &pool = get_thread_local_pool(threads);
@@ -716,6 +723,9 @@ KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const f
 		float y = buffer[i] + bias[i];
 		destination[i] = y < 0.0f ? 0.0f : y;
 	}
+	if (global_config().release_tls_fused_buffers) {
+		std::vector<float>().swap(buffer);
+	}
 }
 
 KLLM_INLINE void fused_fwht_bias_gelu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
@@ -738,6 +748,9 @@ KLLM_INLINE void fused_fwht_bias_gelu(const float * KLLM_RESTRICT input, const f
 		float y = 0.5f * x * (1.0f + std::tanh(t));
 		destination[i] = y;
 	}
+	if (global_config().release_tls_fused_buffers) {
+		std::vector<float>().swap(buffer);
+	}
 }
 
 KLLM_INLINE void fused_fwht_bias_silu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
@@ -758,6 +771,9 @@ KLLM_INLINE void fused_fwht_bias_silu(const float * KLLM_RESTRICT input, const f
 		float x = buffer[i] + bias[i];
 		float s = 1.0f / (1.0f + std::exp(-x));
 		destination[i] = x * s; // swish
+	}
+	if (global_config().release_tls_fused_buffers) {
+		std::vector<float>().swap(buffer);
 	}
 }
 
@@ -1287,7 +1303,8 @@ inline Status train_step_mse(std::vector<float> &params, const std::vector<float
 // ===== v2.1: low-level non-temporal store helpers =====
 #if defined(__AVX2__)
 KLLM_INLINE void stream_store_float32_aligned(float *dst, const float *src) {
-	__m256 v = _mm256_load_ps(src);
+	// Use unaligned load to avoid faults if src is not 32B aligned; dst is aligned by caller logic
+	__m256 v = _mm256_loadu_ps(src);
 	_mm256_stream_ps(dst, v);
 }
 #endif
@@ -1810,13 +1827,13 @@ namespace nn {
 	struct Value; using ValuePtr = std::shared_ptr<Value>;
 	struct Value : public std::enable_shared_from_this<Value> {
 		std::vector<float> values, grad; std::vector<std::size_t> shape; bool requires_grad = false;
-		std::vector<std::weak_ptr<Value>> parents; std::function<void()> backward_fn;
+		std::vector<std::shared_ptr<Value>> parents; std::function<void()> backward_fn;
 		static ValuePtr create(const std::vector<std::size_t> &s, bool rg) { ValuePtr v = std::make_shared<Value>(); v->shape = s; std::size_t n=1; for (auto d:s) n*=d; v->values.assign(n,0.0f); v->grad.assign(n,0.0f); v->requires_grad = rg; return v; }
 		std::size_t numel() const { std::size_t n=1; for (auto d:shape) n*=d; return n; }
 		void zero_grad(){ for(float &g:grad) g=0.0f; }
 		float * data(){ return values.empty()? nullptr: values.data(); }
 		const float * data() const { return values.empty()? nullptr: values.data(); }
-		void backward(){ if (grad.empty()) grad.assign(values.size(),0.0f); if (values.size()==1) grad[0]=1.0f; std::vector<ValuePtr> topo; std::unordered_map<Value*,int> vis; std::function<void(ValuePtr)> dfs=[&](ValuePtr u){ if(vis[u.get()])return; vis[u.get()]=1; for(auto &wp:u->parents){ if(auto p=wp.lock()) dfs(p);} topo.push_back(u);}; dfs(shared_from_this()); for(auto it=topo.rbegin(); it!=topo.rend(); ++it){ if((*it)->backward_fn) (*it)->backward_fn(); } }
+		void backward(){ if (grad.empty()) grad.assign(values.size(),0.0f); if (values.size()==1) grad[0]=1.0f; std::vector<ValuePtr> topo; std::unordered_map<Value*,int> vis; std::function<void(ValuePtr)> dfs=[&](ValuePtr u){ if(vis[u.get()])return; vis[u.get()]=1; for(auto &p:u->parents){ dfs(p);} topo.push_back(u);}; dfs(shared_from_this()); for(auto it=topo.rbegin(); it!=topo.rend(); ++it){ if((*it)->backward_fn) (*it)->backward_fn(); } }
 	};
 	inline bool same(const std::vector<std::size_t>&a,const std::vector<std::size_t>&b){ if(a.size()!=b.size()) return false; for(size_t i=0;i<a.size();++i) if(a[i]!=b[i]) return false; return true; }
 	inline ValuePtr tensor(const std::vector<float>&v,const std::vector<std::size_t>&s,bool rg=false){ auto t=Value::create(s,rg); if(t->values.size()==v.size()) t->values=v; return t; }
@@ -1827,20 +1844,104 @@ namespace nn {
 	inline ValuePtr randn(const std::vector<std::size_t>&s,unsigned seed=123,float stddev=0.02f,bool rg=false){ std::mt19937 rng(seed); std::normal_distribution<float> nd(0.f,stddev); auto t=Value::create(s,rg); for(float &x:t->values) x=nd(rng); return t; }
 	inline void xavier_uniform_(Value &w, unsigned seed=123){ if(w.shape.size()<2) return; float fan_in=float(w.shape[w.shape.size()-2]); float fan_out=float(w.shape[w.shape.size()-1]); float limit = std::sqrt(6.0f/(fan_in+fan_out)); std::mt19937 rng(seed); std::uniform_real_distribution<float> ud(-limit, limit); for(float &v:w.values) v = ud(rng); }
 	inline void he_uniform_(Value &w, unsigned seed=123){ if(w.shape.size()<2) return; float fan_in=float(w.shape[w.shape.size()-2]); float limit = std::sqrt(6.0f/fan_in); std::mt19937 rng(seed); std::uniform_real_distribution<float> ud(-limit, limit); for(float &v:w.values) v = ud(rng); }
-	inline ValuePtr add(const ValuePtr&a,const ValuePtr&b){ if(!same(a->shape,b->shape)) return nullptr; auto o=Value::create(a->shape,a->requires_grad||b->requires_grad); for(size_t i=0;i<o->values.size();++i) o->values[i]=a->values[i]+b->values[i]; o->parents={a,b}; o->backward_fn=[o,a,b](){ if(a->requires_grad) for(size_t i=0;i<o->values.size();++i) a->grad[i]+=o->grad[i]; if(b->requires_grad) for(size_t i=0;i<o->values.size();++i) b->grad[i]+=o->grad[i]; }; return o; }
-	inline ValuePtr mul(const ValuePtr&a,const ValuePtr&b){ if(!same(a->shape,b->shape)) return nullptr; auto o=Value::create(a->shape,a->requires_grad||b->requires_grad); for(size_t i=0;i<o->values.size();++i) o->values[i]=a->values[i]*b->values[i]; o->parents={a,b}; o->backward_fn=[o,a,b](){ if(a->requires_grad) for(size_t i=0;i<o->values.size();++i) a->grad[i]+=o->grad[i]*b->values[i]; if(b->requires_grad) for(size_t i=0;i<o->values.size();++i) b->grad[i]+=o->grad[i]*a->values[i]; }; return o; }
-	inline ValuePtr relu(const ValuePtr&x){ auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i) o->values[i]=x->values[i]<0.f?0.f:x->values[i]; o->parents={x}; o->backward_fn=[o,x](){ if(!x->requires_grad) return; for(size_t i=0;i<o->values.size();++i) x->grad[i]+=o->grad[i]*(x->values[i]>0.f?1.f:0.f);} ; return o; }
-	inline ValuePtr leaky_relu(const ValuePtr&x,float alpha=0.01f){ auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; o->values[i]= (v>0.f)? v : alpha*v; } o->parents={x}; o->backward_fn=[o,x,alpha](){ if(!x->requires_grad) return; for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; x->grad[i]+=o->grad[i]*((v>0.f)?1.f:alpha);} }; return o; }
-	inline ValuePtr elu(const ValuePtr&x,float alpha=1.0f){ auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; o->values[i] = (v>=0.f)? v : alpha*(std::exp(v)-1.f); } o->parents={x}; o->backward_fn=[o,x,alpha](){ if(!x->requires_grad) return; for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; float der = (v>=0.f)? 1.f : (alpha*std::exp(v)); x->grad[i]+=o->grad[i]*der; } }; return o; }
-	inline ValuePtr selu(const ValuePtr&x){ const float lambda=1.0507009873554805f, alpha=1.6732632423543772f; auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; o->values[i] = lambda * ((v>=0.f)? v : alpha*(std::exp(v)-1.f)); } o->parents={x}; o->backward_fn=[o,x,lambda,alpha](){ if(!x->requires_grad) return; for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; float der = lambda * ((v>=0.f)? 1.f : (alpha*std::exp(v))); x->grad[i]+=o->grad[i]*der; } }; return o; }
-	inline ValuePtr gelu(const ValuePtr&x){ auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; float t=v*(0.7978845608028654f)*(1.f+0.044715f*v*v); o->values[i]=0.5f*v*(1.f+std::tanh(t)); } o->parents={x}; o->backward_fn=[o,x](){ if(!x->requires_grad) return; for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; float th=std::tanh(0.7978845608028654f*v*(1.f+0.044715f*v*v)); float tt=0.7978845608028654f*(1.f+0.134145f*v*v); float dy=0.5f*(1.f+th)+0.5f*v*(1.f-th*th)*tt; x->grad[i]+=o->grad[i]*dy; } }; return o; }
-	inline ValuePtr matmul(const ValuePtr&A,const ValuePtr&B){ if(A->shape.size()!=2||B->shape.size()!=2) return nullptr; size_t M=A->shape[0],K=A->shape[1],K2=B->shape[0],N=B->shape[1]; if(K!=K2) return nullptr; auto o=Value::create({M,N},A->requires_grad||B->requires_grad); for(size_t i=0;i<M;++i){ for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t k=0;k<K;++k) acc+=A->values[i*K+k]*B->values[k*N+j]; o->values[i*N+j]=acc; }} o->parents={A,B}; o->backward_fn=[o,A,B,M,K,N](){ if(A->requires_grad){ for(size_t i=0;i<M;++i){ for(size_t k=0;k<K;++k){ float acc=0.f; for(size_t j=0;j<N;++j) acc+=o->grad[i*N+j]*B->values[k*N+j]; A->grad[i*K+k]+=acc; }}} if(B->requires_grad){ for(size_t k=0;k<K;++k){ for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=A->values[i*K+k]*o->grad[i*N+j]; B->grad[k*N+j]+=acc; }}} }; return o; }
-	inline ValuePtr add_bias(const ValuePtr&x,const ValuePtr&b){ if(x->shape.size()!=2||b->shape.size()!=1) return nullptr; size_t M=x->shape[0],N=x->shape[1]; if(b->shape[0]!=N) return nullptr; auto o=Value::create(x->shape,x->requires_grad||b->requires_grad); for(size_t i=0;i<M;++i) for(size_t j=0;j<N;++j) o->values[i*N+j]=x->values[i*N+j]+b->values[j]; o->parents={x,b}; o->backward_fn=[o,x,b,M,N](){ if(x->requires_grad) for(size_t i=0;i<M*N;++i) x->grad[i]+=o->grad[i]; if(b->requires_grad) for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=o->grad[i*N+j]; b->grad[j]+=acc; } }; return o; }
-	inline ValuePtr softmax_lastdim(const ValuePtr&x){ if(x->shape.size()!=2) return nullptr; size_t B=x->shape[0],C=x->shape[1]; auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<B;++i){ float maxv=x->values[i*C]; for(size_t c=1;c<C;++c) maxv=std::max(maxv,x->values[i*C+c]); float sum=0.f; for(size_t c=0;c<C;++c){ float e=std::exp(x->values[i*C+c]-maxv); o->values[i*C+c]=e; sum+=e; } for(size_t c=0;c<C;++c) o->values[i*C+c]/=(sum==0.f?1.f:sum);} o->parents={x}; o->backward_fn=[o,x,B,C](){ if(!x->requires_grad) return; for(size_t i=0;i<B;++i){ float dot=0.f; for(size_t c=0;c<C;++c) dot+=o->grad[i*C+c]*o->values[i*C+c]; for(size_t c=0;c<C;++c) x->grad[i*C+c]+=o->values[i*C+c]*(o->grad[i*C+c]-dot); } }; return o; }
-	inline ValuePtr mse_loss(const ValuePtr&pred,const ValuePtr&target){ if(!same(pred->shape,target->shape)) return nullptr; auto o=Value::create({1},pred->requires_grad||target->requires_grad); size_t n=pred->numel(); double acc=0.0; for(size_t i=0;i<n;++i){ double d=double(pred->values[i])-double(target->values[i]); acc+=d*d; } o->values[0]=float(acc/double(n)); o->parents={pred,target}; o->backward_fn=[o,pred,target,n](){ float g=o->grad[0]*(2.f/float(n)); if(pred->requires_grad) for(size_t i=0;i<n;++i) pred->grad[i]+=g*(pred->values[i]-target->values[i]); if(target->requires_grad) for(size_t i=0;i<n;++i) target->grad[i]+=g*(target->values[i]-pred->values[i]); }; return o; }
-	inline ValuePtr cross_entropy_logits(const ValuePtr&logits,const std::vector<int>&labels){ if(logits->shape.size()!=2) return nullptr; size_t B=logits->shape[0],C=logits->shape[1]; if(labels.size()!=B) return nullptr; auto o=Value::create({1},logits->requires_grad); std::vector<float> sm(B*C); double loss=0.0; for(size_t i=0;i<B;++i){ float maxv=logits->values[i*C]; for(size_t c=1;c<C;++c) maxv=std::max(maxv,logits->values[i*C+c]); float sum=0.f; for(size_t c=0;c<C;++c){ float e=std::exp(logits->values[i*C+c]-maxv); sm[i*C+c]=e; sum+=e; } for(size_t c=0;c<C;++c) sm[i*C+c]/=(sum==0.f?1.f:sum); int y=labels[i]<0?0:(labels[i]>=int(C)?int(C)-1:labels[i]); float p=sm[i*C+size_t(y)]; loss+=-std::log(p<=1e-12f?1e-12f:p);} o->values[0]=float(loss/double(B)); o->parents={logits}; o->backward_fn=[o,logits,sm,B,C,labels](){ if(!logits->requires_grad) return; float g=o->grad[0]/float(B); for(size_t i=0;i<B;++i){ for(size_t c=0;c<C;++c) logits->grad[i*C+c]+=g*sm[i*C+c]; int y=labels[i]<0?0:(labels[i]>=int(C)?int(C)-1:labels[i]); logits->grad[i*C+size_t(y)]-=g; } }; return o; }
+	inline ValuePtr add(const ValuePtr&a,const ValuePtr&b){ if(!same(a->shape,b->shape)) return nullptr; auto o=Value::create(a->shape,a->requires_grad||b->requires_grad); for(size_t i=0;i<o->values.size();++i) o->values[i]=a->values[i]+b->values[i]; o->parents={a,b}; Value *ap=a.get(), *bp=b.get(), *op=o.get(); o->backward_fn=[op,ap,bp](){ if(ap->requires_grad) for(size_t i=0;i<op->values.size();++i) ap->grad[i]+=op->grad[i]; if(bp->requires_grad) for(size_t i=0;i<op->values.size();++i) bp->grad[i]+=op->grad[i]; }; return o; }
+	inline ValuePtr mul(const ValuePtr&a,const ValuePtr&b){ if(!same(a->shape,b->shape)) return nullptr; auto o=Value::create(a->shape,a->requires_grad||b->requires_grad); for(size_t i=0;i<o->values.size();++i) o->values[i]=a->values[i]*b->values[i]; o->parents={a,b}; Value *ap=a.get(), *bp=b.get(), *op=o.get(); o->backward_fn=[op,ap,bp](){ if(ap->requires_grad) for(size_t i=0;i<op->values.size();++i) ap->grad[i]+=op->grad[i]*bp->values[i]; if(bp->requires_grad) for(size_t i=0;i<op->values.size();++i) bp->grad[i]+=op->grad[i]*ap->values[i]; }; return o; }
+	inline ValuePtr relu(const ValuePtr&x){ auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i) o->values[i]=x->values[i]<0.f?0.f:x->values[i]; o->parents={x}; Value *xp=x.get(), *op=o.get(); o->backward_fn=[op,xp](){ if(!xp->requires_grad) return; for(size_t i=0;i<op->values.size();++i) xp->grad[i]+=op->grad[i]*(xp->values[i]>0.f?1.f:0.f);} ; return o; }
+	inline ValuePtr leaky_relu(const ValuePtr&x,float alpha=0.01f){ auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; o->values[i]= (v>0.f)? v : alpha*v; } o->parents={x}; Value *xp=x.get(), *op=o.get(); o->backward_fn=[op,xp,alpha](){ if(!xp->requires_grad) return; for(size_t i=0;i<op->values.size();++i){ float v=xp->values[i]; xp->grad[i]+=op->grad[i]*((v>0.f)?1.f:alpha);} }; return o; }
+	inline ValuePtr elu(const ValuePtr&x,float alpha=1.0f){ auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; o->values[i] = (v>=0.f)? v : alpha*(std::exp(v)-1.f); } o->parents={x}; Value *xp=x.get(), *op=o.get(); o->backward_fn=[op,xp,alpha](){ if(!xp->requires_grad) return; for(size_t i=0;i<op->values.size();++i){ float v=xp->values[i]; float der = (v>=0.f)? 1.f : (alpha*std::exp(v)); xp->grad[i]+=op->grad[i]*der; } }; return o; }
+	inline ValuePtr selu(const ValuePtr&x){ const float lambda=1.0507009873554805f, alpha=1.6732632423543772f; auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; o->values[i] = lambda * ((v>=0.f)? v : alpha*(std::exp(v)-1.f)); } o->parents={x}; Value *xp=x.get(), *op=o.get(); o->backward_fn=[op,xp,lambda,alpha](){ if(!xp->requires_grad) return; for(size_t i=0;i<op->values.size();++i){ float v=xp->values[i]; float der = lambda * ((v>=0.f)? 1.f : (alpha*std::exp(v))); xp->grad[i]+=op->grad[i]*der; } }; return o; }
+	inline ValuePtr gelu(const ValuePtr&x){ auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<o->values.size();++i){ float v=x->values[i]; float t=v*(0.7978845608028654f)*(1.f+0.044715f*v*v); o->values[i]=0.5f*v*(1.f+std::tanh(t)); } o->parents={x}; Value *xp=x.get(), *op=o.get(); o->backward_fn=[op,xp](){ if(!xp->requires_grad) return; for(size_t i=0;i<op->values.size();++i){ float v=xp->values[i]; float th=std::tanh(0.7978845608028654f*v*(1.f+0.044715f*v*v)); float tt=0.7978845608028654f*(1.f+0.134145f*v*v); float dy=0.5f*(1.f+th)+0.5f*v*(1.f-th*th)*tt; xp->grad[i]+=op->grad[i]*dy; } }; return o; }
+	inline ValuePtr matmul(const ValuePtr&A,const ValuePtr&B){
+		if(A->shape.size()!=2||B->shape.size()!=2) return nullptr; size_t M=A->shape[0],K=A->shape[1],K2=B->shape[0],N=B->shape[1]; if(K!=K2) return nullptr;
+		auto o=Value::create({M,N},A->requires_grad||B->requires_grad);
+		float * C = o->values.data();
+		const float * a = A->values.data();
+		const float * b = B->values.data();
+		const bool blocked = global_config().enable_matmul_blocked;
+		const std::size_t BM = std::max<std::size_t>(1, global_config().matmul_block_m);
+		const std::size_t BN = std::max<std::size_t>(1, global_config().matmul_block_n);
+		const std::size_t BK = std::max<std::size_t>(1, global_config().matmul_block_k);
+		auto kernel_tile = [&](size_t i0, size_t j0, size_t mlim, size_t nlim, size_t k0, size_t klim){
+			for(size_t i=i0;i<mlim;++i){
+				float * ci = C + i*N;
+				const float * ai = a + i*K;
+				std::size_t j = j0;
+#if defined(__AVX2__)
+				if (global_config().enable_simd) {
+					for(; j+16<=nlim; j+=16){
+						__m256 sum0=_mm256_loadu_ps(ci+j); __m256 sum1=_mm256_loadu_ps(ci+j+8);
+						for(size_t k=k0;k<klim;++k){ __m256 av=_mm256_set1_ps(ai[k]); const float * bj=b+k*N+j; __m256 bv0=_mm256_loadu_ps(bj); __m256 bv1=_mm256_loadu_ps(bj+8); sum0=_mm256_fmadd_ps(av,bv0,sum0); sum1=_mm256_fmadd_ps(av,bv1,sum1);} _mm256_storeu_ps(ci+j,sum0); _mm256_storeu_ps(ci+j+8,sum1);
+					}
+					for(; j+8<=nlim; j+=8){ __m256 sum=_mm256_loadu_ps(ci+j); for(size_t k=k0;k<klim;++k){ __m256 av=_mm256_set1_ps(ai[k]); __m256 bv=_mm256_loadu_ps(b+k*N+j); sum=_mm256_fmadd_ps(av,bv,sum);} _mm256_storeu_ps(ci+j,sum); }
+				}
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+				if (global_config().enable_simd) {
+					for(; j+8<=nlim; j+=8){ float32x4_t s0=vld1q_f32(ci+j), s1=vld1q_f32(ci+j+4); for(size_t k=k0;k<klim;++k){ float32x4_t av=vdupq_n_f32(ai[k]); const float * bj=b+k*N+j; float32x4_t bv0=vld1q_f32(bj), bv1=vld1q_f32(bj+4); s0=vmlaq_f32(s0,av,bv0); s1=vmlaq_f32(s1,av,bv1);} vst1q_f32(ci+j,s0); vst1q_f32(ci+j+4,s1);} for(; j+4<=nlim; j+=4){ float32x4_t s=vld1q_f32(ci+j); for(size_t k=k0;k<klim;++k){ float32x4_t av=vdupq_n_f32(ai[k]); float32x4_t bv=vld1q_f32(b+k*N+j); s=vmlaq_f32(s,av,bv);} vst1q_f32(ci+j,s);} }
+#endif
+				for(; j<nlim; ++j){ float acc=ci[j]; for(size_t k=k0;k<klim;++k) acc += ai[k]*b[k*N + j]; ci[j]=acc; }
+			}
+		};
+		if (blocked && (M*N >= global_config().parallel_threshold)) {
+			size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+			ThreadPool &pool = get_thread_local_pool(threads);
+			for(size_t i0=0;i0<M;i0+=BM){ size_t mlim=std::min(M,i0+BM);
+				pool.enqueue([=](){
+					for(size_t k0=0;k0<K;k0+=BK){ size_t klim=std::min(K,k0+BK);
+						for(size_t j0=0;j0<N;j0+=BN){ size_t nlim=std::min(N,j0+BN);
+							kernel_tile(i0,j0,mlim,nlim,k0,klim);
+						}
+					}
+				});
+			}
+			pool.wait();
+		} else if (blocked) {
+			for(size_t i0=0;i0<M;i0+=BM){ size_t mlim=std::min(M,i0+BM);
+				for(size_t k0=0;k0<K;k0+=BK){ size_t klim=std::min(K,k0+BK);
+					for(size_t j0=0;j0<N;j0+=BN){ size_t nlim=std::min(N,j0+BN);
+						kernel_tile(i0,j0,mlim,nlim,k0,klim);
+					}
+				}
+			}
+		} else {
+			// Non-blocked accumulation
+			for (size_t i = 0; i < M; ++i) {
+				float * ci = C + i*N;
+				const float * ai = a + i*K;
+				for (size_t k = 0; k < K; ++k) {
+					const float aik = ai[k];
+					const float * bk = b + k*N;
+					std::size_t j = 0;
+#if defined(__AVX2__)
+					if (global_config().enable_simd) {
+						for (; j + 16 <= N; j += 16) { __m256 av=_mm256_set1_ps(aik); __m256 s0=_mm256_loadu_ps(ci+j); __m256 s1=_mm256_loadu_ps(ci+j+8); __m256 bv0=_mm256_loadu_ps(bk+j); __m256 bv1=_mm256_loadu_ps(bk+j+8); s0=_mm256_fmadd_ps(av,bv0,s0); s1=_mm256_fmadd_ps(av,bv1,s1); _mm256_storeu_ps(ci+j,s0); _mm256_storeu_ps(ci+j+8,s1);} for (; j + 8 <= N; j += 8) { __m256 av=_mm256_set1_ps(aik); __m256 s=_mm256_loadu_ps(ci+j); __m256 bv=_mm256_loadu_ps(bk+j); s=_mm256_fmadd_ps(av,bv,s); _mm256_storeu_ps(ci+j,s);} }
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+					if (global_config().enable_simd) { for (; j + 8 <= N; j += 8) { float32x4_t av=vdupq_n_f32(aik); float32x4_t s0=vld1q_f32(ci+j), s1=vld1q_f32(ci+j+4); float32x4_t bv0=vld1q_f32(bk+j), bv1=vld1q_f32(bk+j+4); s0=vmlaq_f32(s0,av,bv0); s1=vmlaq_f32(s1,av,bv1); vst1q_f32(ci+j,s0); vst1q_f32(ci+j+4,s1);} for (; j + 4 <= N; j += 4) { float32x4_t av=vdupq_n_f32(aik); float32x4_t s=vld1q_f32(ci+j); float32x4_t bv=vld1q_f32(bk+j); s=vmlaq_f32(s,av,bv); vst1q_f32(ci+j,s);} }
+#endif
+					for (; j < N; ++j) ci[j] += aik * bk[j];
+				}
+			}
+		}
+		o->parents={A,B}; Value *Ap=A.get(), *Bp=B.get(), *op=o.get(); o->backward_fn=[op,Ap,Bp,M,K,N](){ if(Ap->requires_grad){ for(size_t i=0;i<M;++i){ for(size_t k=0;k<K;++k){ float acc=0.f; for(size_t j=0;j<N;++j) acc+=op->grad[i*N+j]*Bp->values[k*N+j]; Ap->grad[i*K+k]+=acc; }}} if(Bp->requires_grad){ for(size_t k=0;k<K;++k){ for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=Ap->values[i*K+k]*op->grad[i*N+j]; Bp->grad[k*N+j]+=acc; }}} };
+		return o;
+	}
+	inline ValuePtr add_bias(const ValuePtr&x,const ValuePtr&b){ if(x->shape.size()!=2||b->shape.size()!=1) return nullptr; size_t M=x->shape[0],N=x->shape[1]; if(b->shape[0]!=N) return nullptr; auto o=Value::create(x->shape,x->requires_grad||b->requires_grad); for(size_t i=0;i<M;++i) for(size_t j=0;j<N;++j) o->values[i*N+j]=x->values[i*N+j]+b->values[j]; o->parents={x,b}; Value *Xp=x.get(), *Bp=b.get(), *op=o.get(); o->backward_fn=[op,Xp,Bp,M,N](){ if(Xp->requires_grad) for(size_t i=0;i<M*N;++i) Xp->grad[i]+=op->grad[i]; if(Bp->requires_grad) for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=op->grad[i*N+j]; Bp->grad[j]+=acc; } }; return o; }
+	inline ValuePtr softmax_lastdim(const ValuePtr&x){ if(x->shape.size()!=2) return nullptr; size_t B=x->shape[0],C=x->shape[1]; auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<B;++i){ float maxv=x->values[i*C]; for(size_t c=1;c<C;++c) maxv=std::max(maxv,x->values[i*C+c]); float sum=0.f; for(size_t c=0;c<C;++c){ float e=std::exp(x->values[i*C+c]-maxv); o->values[i*C+c]=e; sum+=e; } for(size_t c=0;c<C;++c) o->values[i*C+c]/=(sum==0.f?1.f:sum);} o->parents={x}; Value *Xp=x.get(), *op=o.get(); o->backward_fn=[op,Xp,B,C](){ if(!Xp->requires_grad) return; for(size_t i=0;i<B;++i){ float dot=0.f; for(size_t c=0;c<C;++c) dot+=op->grad[i*C+c]*op->values[i*C+c]; for(size_t c=0;c<C;++c) Xp->grad[i*C+c]+=op->values[i*C+c]*(op->grad[i*C+c]-dot); } }; return o; }
+	inline ValuePtr mse_loss(const ValuePtr&pred,const ValuePtr&target){ if(!same(pred->shape,target->shape)) return nullptr; auto o=Value::create({1},pred->requires_grad||target->requires_grad); size_t n=pred->numel(); double acc=0.0; for(size_t i=0;i<n;++i){ double d=double(pred->values[i])-double(target->values[i]); acc+=d*d; } o->values[0]=float(acc/double(n)); o->parents={pred,target}; Value *Pp=pred.get(), *Tp=target.get(), *op=o.get(); o->backward_fn=[op,Pp,Tp,n](){ float g=op->grad[0]*(2.f/float(n)); if(Pp->requires_grad) for(size_t i=0;i<n;++i) Pp->grad[i]+=g*(Pp->values[i]-Tp->values[i]); if(Tp->requires_grad) for(size_t i=0;i<n;++i) Tp->grad[i]+=g*(Tp->values[i]-Pp->values[i]); }; return o; }
+	inline ValuePtr cross_entropy_logits(const ValuePtr&logits,const std::vector<int>&labels){ if(logits->shape.size()!=2) return nullptr; size_t B=logits->shape[0],C=logits->shape[1]; if(labels.size()!=B) return nullptr; auto o=Value::create({1},logits->requires_grad); std::vector<float> sm(B*C); double loss=0.0; for(size_t i=0;i<B;++i){ float maxv=logits->values[i*C]; for(size_t c=1;c<C;++c) maxv=std::max(maxv,logits->values[i*C+c]); float sum=0.f; for(size_t c=0;c<C;++c){ float e=std::exp(logits->values[i*C+c]-maxv); sm[i*C+c]=e; sum+=e; } for(size_t c=0;c<C;++c) sm[i*C+c]/=(sum==0.f?1.f:sum); int y=labels[i]<0?0:(labels[i]>=int(C)?int(C)-1:labels[i]); float p=sm[i*C+size_t(y)]; loss+=-std::log(p<=1e-12f?1e-12f:p);} o->values[0]=float(loss/double(B)); o->parents={logits}; Value *Lp=logits.get(), *op=o.get(); o->backward_fn=[op,Lp,sm,B,C,labels](){ if(!Lp->requires_grad) return; float g=op->grad[0]/float(B); for(size_t i=0;i<B;++i){ for(size_t c=0;c<C;++c) Lp->grad[i*C+c]+=g*sm[i*C+c]; int y=labels[i]<0?0:(labels[i]>=int(C)?int(C)-1:labels[i]); Lp->grad[i*C+size_t(y)]-=g; } }; return o; }
+
+	inline ValuePtr matmul_add_bias(const ValuePtr&A,const ValuePtr&B,const ValuePtr&bias){
+		if(A->shape.size()!=2||B->shape.size()!=2||bias->shape.size()!=1) return nullptr; size_t M=A->shape[0],K=A->shape[1],K2=B->shape[0],N=B->shape[1]; if(K!=K2||bias->shape[0]!=N) return nullptr;
+		auto y = matmul(A,B); if(!y) return nullptr;
+		for(size_t i=0;i<M;++i){ for(size_t j=0;j<N;++j){ y->values[i*N+j]+=bias->values[j]; }}
+		y->parents={A,B,bias}; Value *Ap=A.get(), *Bp=B.get(), *Bpias=bias.get(), *op=y.get();
+		y->backward_fn=[op,Ap,Bp,Bpias,M,K,N](){ if(Ap->requires_grad){ for(size_t i=0;i<M;++i){ for(size_t k=0;k<K;++k){ float acc=0.f; for(size_t j=0;j<N;++j) acc+=op->grad[i*N+j]*Bp->values[k*N+j]; Ap->grad[i*K+k]+=acc; }}} if(Bp->requires_grad){ for(size_t k=0;k<K;++k){ for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=Ap->values[i*K+k]*op->grad[i*N+j]; Bp->grad[k*N+j]+=acc; }}} if(Bpias->requires_grad){ for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=op->grad[i*N+j]; Bpias->grad[j]+=acc; }}};
+		return y;
+	}
+
 	struct Module{ virtual ~Module()=default; virtual ValuePtr forward(const ValuePtr&x)=0; virtual std::vector<ValuePtr> parameters(){ return {}; } virtual void train(bool /*on*/){ } };
-	struct Linear:Module{ ValuePtr W,b; size_t in_f=0,out_f=0; explicit Linear(size_t in_,size_t out_,unsigned seed=777):W(randn({in_,out_},seed,0.02f,true)),b(zeros({out_},true)),in_f(in_),out_f(out_){} ValuePtr forward(const ValuePtr&x) override { return add_bias(matmul(x,W),b);} std::vector<ValuePtr> parameters() override { return {W,b}; } };
+	struct Linear:Module{ ValuePtr W,b; size_t in_f=0,out_f=0; explicit Linear(size_t in_,size_t out_,unsigned seed=777):W(randn({in_,out_},seed,0.02f,true)),b(zeros({out_},true)),in_f(in_),out_f(out_){} ValuePtr forward(const ValuePtr&x) override { auto o = matmul_add_bias(x,W,b); if(!o) return add_bias(matmul(x,W),b); return o; } std::vector<ValuePtr> parameters() override { return {W,b}; } };
 	struct Sequential:Module{ std::vector<std::shared_ptr<Module>> mods; Sequential()=default; explicit Sequential(std::vector<std::shared_ptr<Module>> m):mods(std::move(m)){} ValuePtr forward(const ValuePtr&x) override { ValuePtr h=x; for(auto &m:mods) h=m->forward(h); return h; } std::vector<ValuePtr> parameters() override { std::vector<ValuePtr> ps; for(auto &m:mods){ auto sub=m->parameters(); ps.insert(ps.end(), sub.begin(), sub.end()); } return ps; } };
 	inline std::vector<ValuePtr> collect_parameters(Module&m){ return m.parameters(); }
 	struct Optimizer{ virtual ~Optimizer()=default; virtual void step()=0; virtual void zero_grad()=0; virtual void set_lr(float){} virtual float get_lr() const { return 0.0f; } };

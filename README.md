@@ -18,10 +18,14 @@ KLLM (Key-Light Large Model) is a C++17 header-only runtime of high-performance 
 - Parallel blockwise quantization (int8/int4)
 - Pipeline buffer reuse to reduce allocations
 - GPU code paths removed; simpler build and predictable performance on CPU
+- Autograd memory fix: safer graph ownership (parents now held as shared_ptr) to avoid leaks and UAF
+- New runtime knobs: `enable_simd`, `enable_matmul_blocked`, `matmul_block_{m,n,k}`, `release_tls_fused_buffers`
 
 Performance snapshot (this environment):
-- Pipeline v2.1 int8 1M: 26–30 ms (down from ~55 ms) depending on run
-- FWHT 1M: ~8.2 ms CPU; fused FWHT-scale-add 1M: ~5.6 ms
+- FWHT 1M: ~2.64–5.22 ms (parallel vs single)
+- Fused FWHT-scale-add 1M: ~6.5 ms
+- Pipeline v2.1 int8 1M: ~24–30 ms
+- Pipeline v2.1 int4 1M: ~23–28 ms
 
 Your mileage varies by CPU.
 
@@ -30,6 +34,7 @@ Your mileage varies by CPU.
 ### Layout
 - `kklm.h`: single public header
 - `examples/main.cpp`: usage demo
+- `examples/miko.cpp`: toy self-play chess learner with emoji board and save/load
 - `bench/bench.cpp`: micro-benchmarks
 - `test.cpp`: correctness tests
 
@@ -43,13 +48,15 @@ Dependencies: clang++ (or g++), Linux or Android/Termux.
 clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC -Wall -Wextra -Wpedantic -Werror \
   -I. examples/main.cpp -o kllm_demo
 clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC -Wall -Wextra -Wpedantic -Werror \
+  -I. examples/miko.cpp -o miko
+clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC -Wall -Wextra -Wpedantic -Werror \
   -I. bench/bench.cpp -o kllm_bench
 clang++ -std=c++17 -O3 -march=native -mtune=native -fPIC -Wall -Wextra -Wpedantic -Werror \
   -I. test.cpp -o kllm_test
 
 # aarch64 (Termux)
 clang++ -std=c++17 -O3 -march=armv8-a+simd -mtune=native -fPIC -Wall -Wextra -Wpedantic -Werror \
-  -I. examples/main.cpp -o kllm_demo
+  -I. examples/miko.cpp -o miko
 ```
 
 Run:
@@ -57,6 +64,7 @@ Run:
 ./kllm_demo
 ./kllm_bench
 ./kllm_test
+./miko
 ```
 
 ---
@@ -70,6 +78,20 @@ Removed. CPU-only.
 Include the header:
 ```cpp
 #include "kklm.h"
+```
+
+Config/tuning (CPU):
+```cpp
+kllm::set_num_threads(8);                  // threads (0 uses hardware_concurrency)
+kllm::set_parallel_threshold(1<<14);       // size threshold for parallel paths
+kllm::set_large_slab_bytes(1024*1024);     // pipeline slab size
+// Direct config access (advanced):
+kllm::global_config().enable_simd = true;            // runtime SIMD on/off
+kllm::global_config().enable_matmul_blocked = true;  // blocked GEMM on/off
+kllm::global_config().matmul_block_m = 64;           // tile sizes
+kllm::global_config().matmul_block_n = 128;
+kllm::global_config().matmul_block_k = 128;
+kllm::global_config().release_tls_fused_buffers = true; // free fused TLS buffers each call
 ```
 
 Core transforms:
@@ -121,32 +143,7 @@ kllm::set_large_slab_bytes(1024*1024);
 Build a tiny MLP classifier using the new minimal nn API:
 ```cpp
 using namespace kllm::nn;
-
-// Data: N samples of D features with integer labels in [0,C)
-std::vector<std::vector<float>> X; std::vector<int> Y; /* fill */
-auto ds = TensorDataset::from(X, Y);
-DataLoader loader(ds, DataLoaderConfig{.batch=64, .shuffle=true});
-
-// Model: D -> 64 -> C
-size_t D = ds.d, C = 10;
-auto net = Sequential({
-  std::make_shared<Linear>(D, 64),
-  // GELU via manual call
-});
-
-// Attach second layer
-net.mods.push_back(std::make_shared<Linear>(64, C));
-
-// Collect params and choose optimizer
-auto params = collect_parameters(net);
-Adam opt(params, 1e-3f);
-
-// Train
-Trainer::Config cfg; cfg.epochs = 5;
-Trainer trainer(cfg);
-auto metrics = trainer.fit(net, loader, opt);
-std::cout << "Loss=" << metrics.loss / metrics.samples
-          << ", Acc=" << metrics.acc << "\n";
+// No API changes required; internal graph ownership improved to prevent leaks.
 ```
 
 Available ops and layers:
@@ -181,17 +178,21 @@ This API is intentionally compact for easy use on mobile/Termux while staying he
 
 ### Benchmarks (this build)
 ```text
-FWHT 1M floats: ~6.17 ms
-FWHT(par,4) 1M floats: ~3.69 ms
-Fused FWHT-scale-add 1M: ~7.21 ms
-NTT 262k uint32: ~4.39 ms
-CountSketch 1M -> 262k: ~4.16 ms
-BlockDiag float 1024x(16x16): ~0.050 ms
-BlockDiag int8 1024x(16x16): ~0.047 ms
-LowRank 4096x4096 (r=64): ~0.000038 ms
-Pipeline v2.1 int8 1M: ~29.65 ms, slabs=4
-Pipeline v2.1 int4 1M: ~34.58 ms, slabs=4
+FWHT 1M floats: ~2.64–5.22 ms
+FWHT(par,4) 1M floats: ~2.64–3.66 ms
+Fused FWHT-scale-add 1M: ~6.5 ms
+NTT 262k uint32: ~4.5 ms
+CountSketch 1M -> 262k: ~4.3 ms
+BlockDiag float 1024x(16x16): ~0.049 ms
+BlockDiag int8 1024x(16x16): ~0.046 ms
+LowRank 4096x4096 (r=64): ~0.00003–0.00004 ms
+Pipeline v2.1 int8 1M: ~24–30 ms (slabs=4)
+Pipeline v2.1 int4 1M: ~23–28 ms (slabs=4)
 ```
+
+Notes:
+- `enable_simd=false` forces scalar paths for maximum portability/testing.
+- Blocked matmul uses runtime tiling; adjust `matmul_block_*` to match cache.
 
 Tips:
 - Increase `set_large_slab_bytes(1<<20)` and set `set_num_threads(6–12)`
