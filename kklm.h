@@ -183,6 +183,7 @@ struct Config {
 	std::size_t sketch_num_hashes = 3; // CountSketch hashes for v2 path
 	std::size_t routing_bucket_size = 256; // elements per routing bucket (approx L2 tile)
 	// v2.2 additions (GPU removed; CPU-only)
+	bool release_tls_fused_buffers = true; // release fused FWHT TLS buffers after each call
 };
 
 inline Config & global_config() {
@@ -669,8 +670,9 @@ KLLM_INLINE void fused_fwht_scale_add(const float * KLLM_RESTRICT input, std::si
 	for (; i < length; ++i) {
 		inout_destination[i] += scale * buffer[i];
 	}
-	// Release memory promptly for thread-local buffer
-	std::vector<float>().swap(buffer);
+	if (global_config().release_tls_fused_buffers) {
+		std::vector<float>().swap(buffer);
+	}
 }
 
 KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
@@ -716,8 +718,9 @@ KLLM_INLINE void fused_fwht_bias_relu(const float * KLLM_RESTRICT input, const f
 		float y = buffer[i] + bias[i];
 		destination[i] = y < 0.0f ? 0.0f : y;
 	}
-	// Release memory promptly for thread-local buffer
-	std::vector<float>().swap(buffer);
+	if (global_config().release_tls_fused_buffers) {
+		std::vector<float>().swap(buffer);
+	}
 }
 
 KLLM_INLINE void fused_fwht_bias_gelu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
@@ -740,8 +743,9 @@ KLLM_INLINE void fused_fwht_bias_gelu(const float * KLLM_RESTRICT input, const f
 		float y = 0.5f * x * (1.0f + std::tanh(t));
 		destination[i] = y;
 	}
-	// Release memory promptly for thread-local buffer
-	std::vector<float>().swap(buffer);
+	if (global_config().release_tls_fused_buffers) {
+		std::vector<float>().swap(buffer);
+	}
 }
 
 KLLM_INLINE void fused_fwht_bias_silu(const float * KLLM_RESTRICT input, const float * KLLM_RESTRICT bias, std::size_t length, float * KLLM_RESTRICT destination) {
@@ -763,8 +767,9 @@ KLLM_INLINE void fused_fwht_bias_silu(const float * KLLM_RESTRICT input, const f
 		float s = 1.0f / (1.0f + std::exp(-x));
 		destination[i] = x * s; // swish
 	}
-	// Release memory promptly for thread-local buffer
-	std::vector<float>().swap(buffer);
+	if (global_config().release_tls_fused_buffers) {
+		std::vector<float>().swap(buffer);
+	}
 }
 
 KLLM_INLINE float l2_norm(const float * KLLM_RESTRICT x, std::size_t length) {
