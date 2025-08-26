@@ -185,6 +185,11 @@ struct Config {
 	// v2.2 additions (GPU removed; CPU-only)
 	bool release_tls_fused_buffers = true; // release fused FWHT TLS buffers after each call
 	bool enable_simd = true; // allow using SIMD paths when compiled in
+	// matmul blocking knobs
+	bool enable_matmul_blocked = true;
+	std::size_t matmul_block_m = 64;
+	std::size_t matmul_block_n = 128;
+	std::size_t matmul_block_k = 128;
 };
 
 inline Config & global_config() {
@@ -1852,68 +1857,70 @@ namespace nn {
 		float * C = o->values.data();
 		const float * a = A->values.data();
 		const float * b = B->values.data();
-		for (size_t i = 0; i < M; ++i) {
-			const float * ai = a + i*K;
-			float * ci = C + i*N;
-			std::size_t j = 0;
+		const bool blocked = global_config().enable_matmul_blocked;
+		const std::size_t BM = std::max<std::size_t>(1, global_config().matmul_block_m);
+		const std::size_t BN = std::max<std::size_t>(1, global_config().matmul_block_n);
+		const std::size_t BK = std::max<std::size_t>(1, global_config().matmul_block_k);
+		auto kernel_tile = [&](size_t i0, size_t j0, size_t mlim, size_t nlim, size_t k0, size_t klim){
+			for(size_t i=i0;i<mlim;++i){
+				float * ci = C + i*N;
+				const float * ai = a + i*K;
+				std::size_t j = j0;
 #if defined(__AVX2__)
-			for (; j + 16 <= N; j += 16) {
-				__m256 sum0 = _mm256_setzero_ps();
-				__m256 sum1 = _mm256_setzero_ps();
-				for (size_t k = 0; k < K; ++k) {
-					__m256 av = _mm256_set1_ps(ai[k]);
-					const float * bj = b + k*N + j;
-					__m256 bv0 = _mm256_loadu_ps(bj);
-					__m256 bv1 = _mm256_loadu_ps(bj + 8);
-					sum0 = _mm256_fmadd_ps(av, bv0, sum0);
-					sum1 = _mm256_fmadd_ps(av, bv1, sum1);
+				if (global_config().enable_simd) {
+					for(; j+16<=nlim; j+=16){
+						__m256 sum0=_mm256_loadu_ps(ci+j); __m256 sum1=_mm256_loadu_ps(ci+j+8);
+						for(size_t k=k0;k<klim;++k){ __m256 av=_mm256_set1_ps(ai[k]); const float * bj=b+k*N+j; __m256 bv0=_mm256_loadu_ps(bj); __m256 bv1=_mm256_loadu_ps(bj+8); sum0=_mm256_fmadd_ps(av,bv0,sum0); sum1=_mm256_fmadd_ps(av,bv1,sum1);} _mm256_storeu_ps(ci+j,sum0); _mm256_storeu_ps(ci+j+8,sum1);
+					}
+					for(; j+8<=nlim; j+=8){ __m256 sum=_mm256_loadu_ps(ci+j); for(size_t k=k0;k<klim;++k){ __m256 av=_mm256_set1_ps(ai[k]); __m256 bv=_mm256_loadu_ps(b+k*N+j); sum=_mm256_fmadd_ps(av,bv,sum);} _mm256_storeu_ps(ci+j,sum); }
 				}
-				_mm256_storeu_ps(ci + j, sum0);
-				_mm256_storeu_ps(ci + j + 8, sum1);
-			}
-			for (; j + 8 <= N; j += 8) {
-				__m256 sum = _mm256_setzero_ps();
-				for (size_t k = 0; k < K; ++k) {
-					__m256 av = _mm256_set1_ps(ai[k]);
-					__m256 bv = _mm256_loadu_ps(b + k*N + j);
-					sum = _mm256_fmadd_ps(av, bv, sum);
-				}
-				_mm256_storeu_ps(ci + j, sum);
-			}
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
-			for (; j + 8 <= N; j += 8) {
-				float32x4_t sum0 = vdupq_n_f32(0.0f), sum1 = vdupq_n_f32(0.0f);
-				for (size_t k = 0; k < K; ++k) {
-					float32x4_t av = vdupq_n_f32(ai[k]);
-					const float * bj = b + k*N + j;
-					float32x4_t bv0 = vld1q_f32(bj);
-					float32x4_t bv1 = vld1q_f32(bj + 4);
-					sum0 = vmlaq_f32(sum0, av, bv0);
-					sum1 = vmlaq_f32(sum1, av, bv1);
-				}
-				vst1q_f32(ci + j, sum0);
-				vst1q_f32(ci + j + 4, sum1);
-			}
-			for (; j + 4 <= N; j += 4) {
-				float32x4_t sum = vdupq_n_f32(0.0f);
-				for (size_t k = 0; k < K; ++k) {
-					float32x4_t av = vdupq_n_f32(ai[k]);
-					float32x4_t bv = vld1q_f32(b + k*N + j);
-					sum = vmlaq_f32(sum, av, bv);
-				}
-				vst1q_f32(ci + j, sum);
-			}
-#else
-			for (; j < N; ++j) {
-				float acc = 0.f;
-				for (size_t k = 0; k < K; ++k) acc += ai[k]*b[k*N + j];
-				ci[j] = acc;
-			}
 #endif
-			for (; j < N; ++j) {
-				float acc = 0.f;
-				for (size_t k = 0; k < K; ++k) acc += ai[k]*b[k*N + j];
-				ci[j] = acc;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+				if (global_config().enable_simd) {
+					for(; j+8<=nlim; j+=8){ float32x4_t s0=vld1q_f32(ci+j), s1=vld1q_f32(ci+j+4); for(size_t k=k0;k<klim;++k){ float32x4_t av=vdupq_n_f32(ai[k]); const float * bj=b+k*N+j; float32x4_t bv0=vld1q_f32(bj), bv1=vld1q_f32(bj+4); s0=vmlaq_f32(s0,av,bv0); s1=vmlaq_f32(s1,av,bv1);} vst1q_f32(ci+j,s0); vst1q_f32(ci+j+4,s1);} for(; j+4<=nlim; j+=4){ float32x4_t s=vld1q_f32(ci+j); for(size_t k=k0;k<klim;++k){ float32x4_t av=vdupq_n_f32(ai[k]); float32x4_t bv=vld1q_f32(b+k*N+j); s=vmlaq_f32(s,av,bv);} vst1q_f32(ci+j,s);} }
+#endif
+				for(; j<nlim; ++j){ float acc=ci[j]; for(size_t k=k0;k<klim;++k) acc += ai[k]*b[k*N + j]; ci[j]=acc; }
+			}
+		};
+		if (blocked && (M*N >= global_config().parallel_threshold)) {
+			size_t threads = global_config().num_threads ? global_config().num_threads : (std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 4);
+			ThreadPool &pool = get_thread_local_pool(threads);
+			for(size_t i0=0;i0<M;i0+=BM){ size_t mlim=std::min(M,i0+BM);
+				pool.enqueue([=](){
+					for(size_t k0=0;k0<K;k0+=BK){ size_t klim=std::min(K,k0+BK);
+						for(size_t j0=0;j0<N;j0+=BN){ size_t nlim=std::min(N,j0+BN);
+							kernel_tile(i0,j0,mlim,nlim,k0,klim);
+						}
+					}
+				});
+			}
+			pool.wait();
+		} else if (blocked) {
+			for(size_t i0=0;i0<M;i0+=BM){ size_t mlim=std::min(M,i0+BM);
+				for(size_t k0=0;k0<K;k0+=BK){ size_t klim=std::min(K,k0+BK);
+					for(size_t j0=0;j0<N;j0+=BN){ size_t nlim=std::min(N,j0+BN);
+						kernel_tile(i0,j0,mlim,nlim,k0,klim);
+					}
+				}
+			}
+		} else {
+			// Non-blocked accumulation
+			for (size_t i = 0; i < M; ++i) {
+				float * ci = C + i*N;
+				const float * ai = a + i*K;
+				for (size_t k = 0; k < K; ++k) {
+					const float aik = ai[k];
+					const float * bk = b + k*N;
+					std::size_t j = 0;
+#if defined(__AVX2__)
+					if (global_config().enable_simd) {
+						for (; j + 16 <= N; j += 16) { __m256 av=_mm256_set1_ps(aik); __m256 s0=_mm256_loadu_ps(ci+j); __m256 s1=_mm256_loadu_ps(ci+j+8); __m256 bv0=_mm256_loadu_ps(bk+j); __m256 bv1=_mm256_loadu_ps(bk+j+8); s0=_mm256_fmadd_ps(av,bv0,s0); s1=_mm256_fmadd_ps(av,bv1,s1); _mm256_storeu_ps(ci+j,s0); _mm256_storeu_ps(ci+j+8,s1);} for (; j + 8 <= N; j += 8) { __m256 av=_mm256_set1_ps(aik); __m256 s=_mm256_loadu_ps(ci+j); __m256 bv=_mm256_loadu_ps(bk+j); s=_mm256_fmadd_ps(av,bv,s); _mm256_storeu_ps(ci+j,s);} }
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+					if (global_config().enable_simd) { for (; j + 8 <= N; j += 8) { float32x4_t av=vdupq_n_f32(aik); float32x4_t s0=vld1q_f32(ci+j), s1=vld1q_f32(ci+j+4); float32x4_t bv0=vld1q_f32(bk+j), bv1=vld1q_f32(bk+j+4); s0=vmlaq_f32(s0,av,bv0); s1=vmlaq_f32(s1,av,bv1); vst1q_f32(ci+j,s0); vst1q_f32(ci+j+4,s1);} for (; j + 4 <= N; j += 4) { float32x4_t av=vdupq_n_f32(aik); float32x4_t s=vld1q_f32(ci+j); float32x4_t bv=vld1q_f32(bk+j); s=vmlaq_f32(s,av,bv); vst1q_f32(ci+j,s);} }
+#endif
+					for (; j < N; ++j) ci[j] += aik * bk[j];
+				}
 			}
 		}
 		o->parents={A,B}; Value *Ap=A.get(), *Bp=B.get(), *op=o.get(); o->backward_fn=[op,Ap,Bp,M,K,N](){ if(Ap->requires_grad){ for(size_t i=0;i<M;++i){ for(size_t k=0;k<K;++k){ float acc=0.f; for(size_t j=0;j<N;++j) acc+=op->grad[i*N+j]*Bp->values[k*N+j]; Ap->grad[i*K+k]+=acc; }}} if(Bp->requires_grad){ for(size_t k=0;k<K;++k){ for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=Ap->values[i*K+k]*op->grad[i*N+j]; Bp->grad[k*N+j]+=acc; }}} };
@@ -1923,8 +1930,18 @@ namespace nn {
 	inline ValuePtr softmax_lastdim(const ValuePtr&x){ if(x->shape.size()!=2) return nullptr; size_t B=x->shape[0],C=x->shape[1]; auto o=Value::create(x->shape,x->requires_grad); for(size_t i=0;i<B;++i){ float maxv=x->values[i*C]; for(size_t c=1;c<C;++c) maxv=std::max(maxv,x->values[i*C+c]); float sum=0.f; for(size_t c=0;c<C;++c){ float e=std::exp(x->values[i*C+c]-maxv); o->values[i*C+c]=e; sum+=e; } for(size_t c=0;c<C;++c) o->values[i*C+c]/=(sum==0.f?1.f:sum);} o->parents={x}; Value *Xp=x.get(), *op=o.get(); o->backward_fn=[op,Xp,B,C](){ if(!Xp->requires_grad) return; for(size_t i=0;i<B;++i){ float dot=0.f; for(size_t c=0;c<C;++c) dot+=op->grad[i*C+c]*op->values[i*C+c]; for(size_t c=0;c<C;++c) Xp->grad[i*C+c]+=op->values[i*C+c]*(op->grad[i*C+c]-dot); } }; return o; }
 	inline ValuePtr mse_loss(const ValuePtr&pred,const ValuePtr&target){ if(!same(pred->shape,target->shape)) return nullptr; auto o=Value::create({1},pred->requires_grad||target->requires_grad); size_t n=pred->numel(); double acc=0.0; for(size_t i=0;i<n;++i){ double d=double(pred->values[i])-double(target->values[i]); acc+=d*d; } o->values[0]=float(acc/double(n)); o->parents={pred,target}; Value *Pp=pred.get(), *Tp=target.get(), *op=o.get(); o->backward_fn=[op,Pp,Tp,n](){ float g=op->grad[0]*(2.f/float(n)); if(Pp->requires_grad) for(size_t i=0;i<n;++i) Pp->grad[i]+=g*(Pp->values[i]-Tp->values[i]); if(Tp->requires_grad) for(size_t i=0;i<n;++i) Tp->grad[i]+=g*(Tp->values[i]-Pp->values[i]); }; return o; }
 	inline ValuePtr cross_entropy_logits(const ValuePtr&logits,const std::vector<int>&labels){ if(logits->shape.size()!=2) return nullptr; size_t B=logits->shape[0],C=logits->shape[1]; if(labels.size()!=B) return nullptr; auto o=Value::create({1},logits->requires_grad); std::vector<float> sm(B*C); double loss=0.0; for(size_t i=0;i<B;++i){ float maxv=logits->values[i*C]; for(size_t c=1;c<C;++c) maxv=std::max(maxv,logits->values[i*C+c]); float sum=0.f; for(size_t c=0;c<C;++c){ float e=std::exp(logits->values[i*C+c]-maxv); sm[i*C+c]=e; sum+=e; } for(size_t c=0;c<C;++c) sm[i*C+c]/=(sum==0.f?1.f:sum); int y=labels[i]<0?0:(labels[i]>=int(C)?int(C)-1:labels[i]); float p=sm[i*C+size_t(y)]; loss+=-std::log(p<=1e-12f?1e-12f:p);} o->values[0]=float(loss/double(B)); o->parents={logits}; Value *Lp=logits.get(), *op=o.get(); o->backward_fn=[op,Lp,sm,B,C,labels](){ if(!Lp->requires_grad) return; float g=op->grad[0]/float(B); for(size_t i=0;i<B;++i){ for(size_t c=0;c<C;++c) Lp->grad[i*C+c]+=g*sm[i*C+c]; int y=labels[i]<0?0:(labels[i]>=int(C)?int(C)-1:labels[i]); Lp->grad[i*C+size_t(y)]-=g; } }; return o; }
+
+	inline ValuePtr matmul_add_bias(const ValuePtr&A,const ValuePtr&B,const ValuePtr&bias){
+		if(A->shape.size()!=2||B->shape.size()!=2||bias->shape.size()!=1) return nullptr; size_t M=A->shape[0],K=A->shape[1],K2=B->shape[0],N=B->shape[1]; if(K!=K2||bias->shape[0]!=N) return nullptr;
+		auto y = matmul(A,B); if(!y) return nullptr;
+		for(size_t i=0;i<M;++i){ for(size_t j=0;j<N;++j){ y->values[i*N+j]+=bias->values[j]; }}
+		y->parents={A,B,bias}; Value *Ap=A.get(), *Bp=B.get(), *Bpias=bias.get(), *op=y.get();
+		y->backward_fn=[op,Ap,Bp,Bpias,M,K,N](){ if(Ap->requires_grad){ for(size_t i=0;i<M;++i){ for(size_t k=0;k<K;++k){ float acc=0.f; for(size_t j=0;j<N;++j) acc+=op->grad[i*N+j]*Bp->values[k*N+j]; Ap->grad[i*K+k]+=acc; }}} if(Bp->requires_grad){ for(size_t k=0;k<K;++k){ for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=Ap->values[i*K+k]*op->grad[i*N+j]; Bp->grad[k*N+j]+=acc; }}} if(Bpias->requires_grad){ for(size_t j=0;j<N;++j){ float acc=0.f; for(size_t i=0;i<M;++i) acc+=op->grad[i*N+j]; Bpias->grad[j]+=acc; }}};
+		return y;
+	}
+
 	struct Module{ virtual ~Module()=default; virtual ValuePtr forward(const ValuePtr&x)=0; virtual std::vector<ValuePtr> parameters(){ return {}; } virtual void train(bool /*on*/){ } };
-	struct Linear:Module{ ValuePtr W,b; size_t in_f=0,out_f=0; explicit Linear(size_t in_,size_t out_,unsigned seed=777):W(randn({in_,out_},seed,0.02f,true)),b(zeros({out_},true)),in_f(in_),out_f(out_){} ValuePtr forward(const ValuePtr&x) override { return add_bias(matmul(x,W),b);} std::vector<ValuePtr> parameters() override { return {W,b}; } };
+	struct Linear:Module{ ValuePtr W,b; size_t in_f=0,out_f=0; explicit Linear(size_t in_,size_t out_,unsigned seed=777):W(randn({in_,out_},seed,0.02f,true)),b(zeros({out_},true)),in_f(in_),out_f(out_){} ValuePtr forward(const ValuePtr&x) override { auto o = matmul_add_bias(x,W,b); if(!o) return add_bias(matmul(x,W),b); return o; } std::vector<ValuePtr> parameters() override { return {W,b}; } };
 	struct Sequential:Module{ std::vector<std::shared_ptr<Module>> mods; Sequential()=default; explicit Sequential(std::vector<std::shared_ptr<Module>> m):mods(std::move(m)){} ValuePtr forward(const ValuePtr&x) override { ValuePtr h=x; for(auto &m:mods) h=m->forward(h); return h; } std::vector<ValuePtr> parameters() override { std::vector<ValuePtr> ps; for(auto &m:mods){ auto sub=m->parameters(); ps.insert(ps.end(), sub.begin(), sub.end()); } return ps; } };
 	inline std::vector<ValuePtr> collect_parameters(Module&m){ return m.parameters(); }
 	struct Optimizer{ virtual ~Optimizer()=default; virtual void step()=0; virtual void zero_grad()=0; virtual void set_lr(float){} virtual float get_lr() const { return 0.0f; } };
