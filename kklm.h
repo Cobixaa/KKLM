@@ -184,6 +184,7 @@ struct Config {
 	std::size_t routing_bucket_size = 256; // elements per routing bucket (approx L2 tile)
 	// v2.2 additions (GPU removed; CPU-only)
 	bool release_tls_fused_buffers = true; // release fused FWHT TLS buffers after each call
+	bool enable_simd = true; // allow using SIMD paths when compiled in
 };
 
 inline Config & global_config() {
@@ -570,39 +571,38 @@ KLLM_INLINE void fwht_inplace_parallel(float * KLLM_RESTRICT data, std::size_t l
 		parallel_for_blocks(pool, 0, length, full_block, [=](std::size_t block_start) {
 			std::size_t i = 0;
 #if defined(__AVX2__)
-			const std::size_t vec_width = 8;
-			for (; i + vec_width <= half_block; i += vec_width) {
-				float *a_ptr = data + block_start + i;
-				float *b_ptr = data + block_start + i + half_block;
-				prefetch(a_ptr + global_config().prefetch_distance);
-				prefetch(b_ptr + global_config().prefetch_distance);
-				const bool aligned = is_aligned_32(a_ptr) && is_aligned_32(b_ptr);
-				__m256 a = aligned ? _mm256_load_ps(a_ptr) : _mm256_loadu_ps(a_ptr);
-				__m256 b = aligned ? _mm256_load_ps(b_ptr) : _mm256_loadu_ps(b_ptr);
-				__m256 sum = _mm256_add_ps(a, b);
-				__m256 diff = _mm256_sub_ps(a, b);
-				if (aligned) {
-					_mm256_store_ps(a_ptr, sum);
-					_mm256_store_ps(b_ptr, diff);
-				} else {
-					_mm256_storeu_ps(a_ptr, sum);
-					_mm256_storeu_ps(b_ptr, diff);
+			if (global_config().enable_simd) {
+				const std::size_t vec_width = 8;
+				for (; i + vec_width <= half_block; i += vec_width) {
+					float *a_ptr = data + block_start + i;
+					float *b_ptr = data + block_start + i + half_block;
+					prefetch(a_ptr + global_config().prefetch_distance);
+					prefetch(b_ptr + global_config().prefetch_distance);
+					const bool aligned = is_aligned_32(a_ptr) && is_aligned_32(b_ptr);
+					__m256 a = aligned ? _mm256_load_ps(a_ptr) : _mm256_loadu_ps(a_ptr);
+					__m256 b = aligned ? _mm256_load_ps(b_ptr) : _mm256_loadu_ps(b_ptr);
+					__m256 sum = _mm256_add_ps(a, b);
+					__m256 diff = _mm256_sub_ps(a, b);
+					if (aligned) { _mm256_store_ps(a_ptr, sum); _mm256_store_ps(b_ptr, diff); }
+					else { _mm256_storeu_ps(a_ptr, sum); _mm256_storeu_ps(b_ptr, diff); }
 				}
 			}
 #endif
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
-			const std::size_t neon_width = 4;
-			for (; i + neon_width <= half_block; i += neon_width) {
-				float *a_ptr = data + block_start + i;
-				float *b_ptr = data + block_start + i + half_block;
-				prefetch(a_ptr + global_config().prefetch_distance);
-				prefetch(b_ptr + global_config().prefetch_distance);
-				float32x4_t a = vld1q_f32(a_ptr);
-				float32x4_t b = vld1q_f32(b_ptr);
-				float32x4_t sum = vaddq_f32(a, b);
-				float32x4_t diff = vsubq_f32(a, b);
-				vst1q_f32(a_ptr, sum);
-				vst1q_f32(b_ptr, diff);
+			if (global_config().enable_simd) {
+				const std::size_t neon_width = 4;
+				for (; i + neon_width <= half_block; i += neon_width) {
+					float *a_ptr = data + block_start + i;
+					float *b_ptr = data + block_start + i + half_block;
+					prefetch(a_ptr + global_config().prefetch_distance);
+					prefetch(b_ptr + global_config().prefetch_distance);
+					float32x4_t a = vld1q_f32(a_ptr);
+					float32x4_t b = vld1q_f32(b_ptr);
+					float32x4_t sum = vaddq_f32(a, b);
+					float32x4_t diff = vsubq_f32(a, b);
+					vst1q_f32(a_ptr, sum);
+					vst1q_f32(b_ptr, diff);
+				}
 			}
 #endif
 			for (; i < half_block; ++i) {
