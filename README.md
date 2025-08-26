@@ -19,11 +19,13 @@ KLLM (Key-Light Large Model) is a C++17 header-only runtime of high-performance 
 - Pipeline buffer reuse to reduce allocations
 - GPU code paths removed; simpler build and predictable performance on CPU
 - Autograd memory fix: safer graph ownership (parents now held as shared_ptr) to avoid leaks and UAF
+- New runtime knobs: `enable_simd`, `enable_matmul_blocked`, `matmul_block_{m,n,k}`, `release_tls_fused_buffers`
 
 Performance snapshot (this environment):
-- Pipeline v2.1 int8 1M: ~23–32 ms depending on run
-- FWHT 1M: ~3.4 ms (parallel 4 threads)
-- Fused FWHT-scale-add 1M: ~5.6 ms
+- FWHT 1M: ~2.64–5.22 ms (parallel vs single)
+- Fused FWHT-scale-add 1M: ~6.5 ms
+- Pipeline v2.1 int8 1M: ~24–30 ms
+- Pipeline v2.1 int4 1M: ~23–28 ms
 
 Your mileage varies by CPU.
 
@@ -76,6 +78,20 @@ Removed. CPU-only.
 Include the header:
 ```cpp
 #include "kklm.h"
+```
+
+Config/tuning (CPU):
+```cpp
+kllm::set_num_threads(8);                  // threads (0 uses hardware_concurrency)
+kllm::set_parallel_threshold(1<<14);       // size threshold for parallel paths
+kllm::set_large_slab_bytes(1024*1024);     // pipeline slab size
+// Direct config access (advanced):
+kllm::global_config().enable_simd = true;            // runtime SIMD on/off
+kllm::global_config().enable_matmul_blocked = true;  // blocked GEMM on/off
+kllm::global_config().matmul_block_m = 64;           // tile sizes
+kllm::global_config().matmul_block_n = 128;
+kllm::global_config().matmul_block_k = 128;
+kllm::global_config().release_tls_fused_buffers = true; // free fused TLS buffers each call
 ```
 
 Core transforms:
@@ -162,20 +178,21 @@ This API is intentionally compact for easy use on mobile/Termux while staying he
 
 ### Benchmarks (this build)
 ```text
-FWHT 1M floats: ~3.36 ms
-FWHT(par,4) 1M floats: ~3.21 ms
-Fused FWHT-scale-add 1M: ~5.66 ms
-NTT 262k uint32: ~4.43 ms
-CountSketch 1M -> 262k: ~4.11 ms
+FWHT 1M floats: ~2.64–5.22 ms
+FWHT(par,4) 1M floats: ~2.64–3.66 ms
+Fused FWHT-scale-add 1M: ~6.5 ms
+NTT 262k uint32: ~4.5 ms
+CountSketch 1M -> 262k: ~4.3 ms
 BlockDiag float 1024x(16x16): ~0.049 ms
-BlockDiag int8 1024x(16x16): ~0.047 ms
-LowRank 4096x4096 (r=64): ~0.000039 ms
-Pipeline v2.1 int8 1M: ~31.6 ms, slabs=4
-Pipeline v2.1 int4 1M: ~23.5 ms, slabs=4
+BlockDiag int8 1024x(16x16): ~0.046 ms
+LowRank 4096x4096 (r=64): ~0.00003–0.00004 ms
+Pipeline v2.1 int8 1M: ~24–30 ms (slabs=4)
+Pipeline v2.1 int4 1M: ~23–28 ms (slabs=4)
 ```
 
 Notes:
-- Autograd graph now uses shared ownership for parent links; this fixes leaks seen with sanitizers and prevents potential UAF when intermediate nodes go out of scope.
+- `enable_simd=false` forces scalar paths for maximum portability/testing.
+- Blocked matmul uses runtime tiling; adjust `matmul_block_*` to match cache.
 
 Tips:
 - Increase `set_large_slab_bytes(1<<20)` and set `set_num_threads(6–12)`
