@@ -1825,16 +1825,16 @@ inline Status run_pipeline_v21_to_int4(const std::vector<float> &input, std::siz
 // ===== nn/autograd/optim/data/trainer (minimal, header-only) =====
 namespace nn {
 	struct Value; using ValuePtr = std::shared_ptr<Value>;
-	struct Value : public std::enable_shared_from_this<Value> {
-		std::vector<float> values, grad; std::vector<std::size_t> shape; bool requires_grad = false;
-		std::vector<std::shared_ptr<Value>> parents; std::function<void()> backward_fn;
-		static ValuePtr create(const std::vector<std::size_t> &s, bool rg) { ValuePtr v = std::make_shared<Value>(); v->shape = s; std::size_t n=1; for (auto d:s) n*=d; v->values.assign(n,0.0f); v->grad.assign(n,0.0f); v->requires_grad = rg; return v; }
-		std::size_t numel() const { std::size_t n=1; for (auto d:shape) n*=d; return n; }
-		void zero_grad(){ for(float &g:grad) g=0.0f; }
-		float * data(){ return values.empty()? nullptr: values.data(); }
-		const float * data() const { return values.empty()? nullptr: values.data(); }
-		void backward(){ if (grad.empty()) grad.assign(values.size(),0.0f); if (values.size()==1) grad[0]=1.0f; std::vector<ValuePtr> topo; std::unordered_map<Value*,int> vis; std::function<void(ValuePtr)> dfs=[&](ValuePtr u){ if(vis[u.get()])return; vis[u.get()]=1; for(auto &p:u->parents){ dfs(p);} topo.push_back(u);}; dfs(shared_from_this()); for(auto it=topo.rbegin(); it!=topo.rend(); ++it){ if((*it)->backward_fn) (*it)->backward_fn(); } }
-	};
+			struct Value : public std::enable_shared_from_this<Value> {
+			std::vector<float> values, grad; std::vector<std::size_t> shape; bool requires_grad = false;
+			std::vector<std::shared_ptr<Value>> parents; std::function<void()> backward_fn;
+			static ValuePtr create(const std::vector<std::size_t> &s, bool rg) { ValuePtr v = std::make_shared<Value>(); v->shape = s; std::size_t n=1; for (auto d:s) n*=d; v->values.assign(n,0.0f); if(rg){ v->grad.assign(n,0.0f); } else { v->grad.clear(); } v->requires_grad = rg; return v; }
+			std::size_t numel() const { std::size_t n=1; for (auto d:shape) n*=d; return n; }
+			void zero_grad(){ for(float &g:grad) g=0.0f; }
+			float * data(){ return values.empty()? nullptr: values.data(); }
+			const float * data() const { return values.empty()? nullptr: values.data(); }
+			void backward(){ if (grad.empty()) grad.assign(values.size(),0.0f); if (values.size()==1) grad[0]=1.0f; std::vector<ValuePtr> topo; std::unordered_map<Value*,int> vis; std::function<void(ValuePtr)> dfs=[&](ValuePtr u){ if(vis[u.get()])return; vis[u.get()]=1; for(auto &p:u->parents){ dfs(p);} topo.push_back(u);}; dfs(shared_from_this()); for(auto &node: topo){ if(node->requires_grad && node->grad.size()!=node->values.size()){ node->grad.assign(node->values.size(), 0.0f); } } for(auto it=topo.rbegin(); it!=topo.rend(); ++it){ if((*it)->backward_fn) (*it)->backward_fn(); } }
+		};
 	inline bool same(const std::vector<std::size_t>&a,const std::vector<std::size_t>&b){ if(a.size()!=b.size()) return false; for(size_t i=0;i<a.size();++i) if(a[i]!=b[i]) return false; return true; }
 	inline ValuePtr tensor(const std::vector<float>&v,const std::vector<std::size_t>&s,bool rg=false){ auto t=Value::create(s,rg); if(t->values.size()==v.size()) t->values=v; return t; }
 	inline ValuePtr zeros(const std::vector<std::size_t>&s,bool rg=false){ return Value::create(s,rg);} 
